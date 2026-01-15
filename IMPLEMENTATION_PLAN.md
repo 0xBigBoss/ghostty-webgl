@@ -391,6 +391,40 @@ function measureGlyph(ctx: CanvasRenderingContext2D, char: string): GlyphBearing
    - Key by grapheme string (handles combining marks)
    - Evict when atlas full, re-rasterize on demand
 
+**Atlas packing strategy (shelf algorithm recommended):**
+- **Shelf packing**: Best compromise for glyphs - simple, efficient, fast
+- Separate 2D allocation into vertical shelf management + horizontal item placement
+- xterm.js uses multiple active rows, selecting based on glyph pixel height
+- Slab allocator (fixed power-of-two slots) wastes >50% space for non-square glyphs
+- Alternative: 2D texture array with 1×32 glyph grid per layer (beamterm approach)
+
+```typescript
+// Simple shelf packing sketch
+interface Shelf {
+  y: number
+  height: number
+  nextX: number
+}
+
+function allocateGlyph(width: number, height: number): { x: number; y: number } | null {
+  // Find best-fit shelf (closest height match)
+  const shelf = shelves.find(s => s.height >= height && atlasWidth - s.nextX >= width)
+  if (shelf) {
+    const x = shelf.nextX
+    shelf.nextX += width
+    return { x, y: shelf.y }
+  }
+  // Create new shelf if space available
+  if (nextShelfY + height <= atlasHeight) {
+    const newShelf = { y: nextShelfY, height, nextX: width }
+    shelves.push(newShelf)
+    nextShelfY += height
+    return { x: 0, y: newShelf.y }
+  }
+  return null  // Atlas full, trigger LRU eviction or resize
+}
+```
+
 4. Separate RGBA atlas for color emoji:
    - Detect emoji ranges, route to color atlas
    - Separate texture unit in shader
@@ -506,6 +540,28 @@ void main() {
 4. Handle wide glyphs (`cellSpan=2` uses double-width atlas entry)
 5. Use premultiplied-alpha blending globally: `gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA)`
 
+**Premultiplied alpha blending (critical for correct compositing):**
+WebGL composites with premultiplied alpha by default. Using the wrong blend function causes washed-out colors.
+
+```typescript
+// CORRECT: Premultiplied alpha (WebGL default compositing)
+gl.enable(gl.BLEND)
+gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
+// Formula: src + dst * (1 - srcA)
+
+// WRONG: Non-premultiplied (causes artifacts with WebGL compositing)
+// gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+// Formula: src * srcA + dst * (1 - srcA)
+
+// For glyph atlas: output is already premultiplied
+// fragColor = vec4(fgColor.rgb * alpha, alpha)  // Premultiply in shader
+// OR upload with UNPACK_PREMULTIPLY_ALPHA_WEBGL = true
+```
+
+**Context `alpha` option:**
+Avoid `alpha: false` - it causes performance cost on some platforms (RGB backbuffer emulated on RGBA).
+Instead, use `alpha: true` and write `1.0` to alpha channel where transparency isn't needed.
+
 **Deliverable:** Text renders with correct overflow, no clipping.
 
 ---
@@ -598,6 +654,18 @@ if (atlasSize > maxSize) {
 | Color emoji | `RGBA8` | `RGBA` | `UNSIGNED_BYTE` | Premultiplied alpha |
 | Fallback (WebGL1 compat) | `LUMINANCE` | `LUMINANCE` | `UNSIGNED_BYTE` | Avoid; prefer R8 |
 
+**Important:** Avoid `RGB8` - it's surprisingly slow due to alpha masking overhead. Use `RGBA8` and ignore alpha instead.
+
+**Use `texStorage2D` for atlas allocation:**
+```typescript
+// Preferred: predictable GPU memory, no mipmap chain allocation
+gl.texStorage2D(gl.TEXTURE_2D, 1, gl.R8, atlasWidth, atlasHeight)
+gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, w, h, gl.RED, gl.UNSIGNED_BYTE, glyphData)
+
+// Avoid: texImage2D may cause driver to allocate full mip chain
+// gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, w, h, 0, gl.RED, gl.UNSIGNED_BYTE, data)
+```
+
 **sRGB color space handling:**
 - WebGL2 framebuffer is linear by default; CSS/Canvas colors are sRGB.
 - For accurate color reproduction, either:
@@ -624,8 +692,9 @@ if (dirtyRowCount > rows * 0.5) {
 **Integer vertex attributes (WebGL2):**
 ```glsl
 // Vertex shader: use flat integers for flags
-layout(location = 3) in uint a_flags;  // cellSpan | decoFlags | glyphFlags packed
-flat out uint v_flags;
+// CRITICAL: Use highp for 32-bit integers on iOS (mediump = 16-bit, lowp = 9-bit)
+layout(location = 3) in highp uint a_flags;  // cellSpan | decoFlags | glyphFlags packed
+flat out highp uint v_flags;
 
 void main() {
   uint cellSpan = a_flags & 0xFFu;
@@ -640,14 +709,42 @@ gl.enableVertexAttribArray(3)
 gl.vertexAttribDivisor(3, 1)  // Per-instance
 ```
 
+**iOS/Safari precision requirements:**
+- `highp int` required for 32-bit integers (works on desktop without, fails on Android/iOS)
+- `highp sampler2D` required for float textures on iOS (without: ±2.0 range only)
+- Always specify precision explicitly for cross-platform compatibility
+
 **Context loss recovery checklist:**
-1. `webglcontextlost`: `event.preventDefault()`, set `contextValid = false`
+1. `webglcontextlost`: `event.preventDefault()`, set `contextValid = false`, cancel animation frames
 2. `webglcontextrestored`:
    - Re-create all WebGL resources (programs, buffers, textures, VAOs)
    - Re-upload glyph atlas from cached Canvas data
    - Re-upload instance buffer (full buffer)
    - Set `contextValid = true`, trigger full redraw
 3. Track consecutive failures; after 3, fallback permanently to Canvas
+4. Check `gl.isContextLost()` in error handlers to avoid false shader compile errors
+
+```typescript
+// Context loss handling pattern
+canvas.addEventListener('webglcontextlost', (e) => {
+  e.preventDefault()  // Required to allow restore
+  contextValid = false
+  if (animationFrameId) cancelAnimationFrame(animationFrameId)
+})
+
+canvas.addEventListener('webglcontextrestored', () => {
+  initWebGL()        // Re-create programs, VAOs, buffers
+  rebuildAtlas()     // Re-upload glyph textures
+  contextValid = true
+  requestRender()    // Trigger full redraw
+})
+
+// In error handling
+if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+  if (gl.isContextLost()) return  // Don't log errors during context loss
+  console.error(gl.getShaderInfoLog(shader))
+}
+```
 
 ---
 
@@ -759,8 +856,25 @@ if (uploadTime > 2 && dirtyRowCount < rows * 0.5) {
 
 ## References
 
-- [xterm.js addon-webgl](https://github.com/xtermjs/xterm.js/tree/master/addons/addon-webgl)
-- [WebGL Instanced Drawing](https://webglfundamentals.org/webgl/lessons/webgl-instanced-drawing.html)
-- [VS Code WebGL PR #84440](https://github.com/microsoft/vscode/pull/84440)
+### Implementation References
+- [xterm.js addon-webgl](https://github.com/xtermjs/xterm.js/tree/master/addons/addon-webgl) - Production WebGL2 terminal renderer
+- [beamterm](https://github.com/junkdog/beamterm) - Sub-millisecond WebGL2 terminal rendering (<1ms at 45k cells)
+- [VS Code WebGL PR #84440](https://github.com/microsoft/vscode/pull/84440) - 3-9x performance improvement data
 - ghostty-web Canvas renderer: `packages/ghostty-web/lib/renderer.ts`
 - ghostty RenderState API: `packages/ghostty-web/lib/ghostty.ts`
+
+### WebGL2 Best Practices
+- [MDN WebGL Best Practices](https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/WebGL_best_practices) - Texture formats, buffer updates, iOS precision
+- [WebGL and Alpha](https://webglfundamentals.org/webgl/lessons/webgl-and-alpha.html) - Premultiplied alpha blending
+- [WebGL Instanced Drawing](https://webglfundamentals.org/webgl/lessons/webgl-instanced-drawing.html) - Instancing fundamentals
+- [Khronos Context Loss Wiki](https://www.khronos.org/webgl/wiki/HandlingContextLost) - Context loss handling
+
+### Texture Atlas & Text Rendering
+- [WebRender Texture Atlas (etagere)](https://nical.github.io/posts/etagere.html) - Shelf packing algorithm analysis
+- [WebGL Text with Glyph Textures](https://webglfundamentals.org/webgl/lessons/webgl-text-glyphs.html) - Glyph atlas fundamentals
+- [Warp Glyph Atlases](https://www.warp.dev/blog/adventures-text-rendering-kerning-glyph-atlases) - Production terminal atlas strategy
+
+### Browser Compatibility
+- [WebGL2 Browser Support](https://caniuse.com/webgl2) - Current support matrix
+- iOS 18.4 WebGL issues affect iPad 9th gen and below (April 2025)
+- Safari 18 removed Experimental Features menu for WebGL2 toggle
