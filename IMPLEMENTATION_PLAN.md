@@ -58,38 +58,49 @@ ghostty-webgl/
 1. Define extended `Renderer` interface:
    ```typescript
    interface RenderInput {
-     // Viewport
+     // Viewport dimensions
      cols: number
      rows: number
-     viewportY: number
 
-     // Cell data (from RenderState.getViewport())
-     cells: GhosttyCell[]
+     // Visible viewport cells, already composed from scrollback + screen
+     // Length = cols * rows, row-major order
+     // Composition rule (caller responsibility):
+     //   If viewportY > 0, rows [0..viewportY-1] come from scrollback
+     //   and rows [viewportY..rows-1] come from screen.
+     viewportCells: GhosttyCell[]
+
+     // Row flags bitfield for viewport rows (avoids Set allocations)
+     // bit0 = dirty, bit1 = hasSelection, bit2 = hasHyperlink
+     rowFlags: Uint8Array  // length = rows
 
      // Dirty tracking
      dirtyState: DirtyState
-     isRowDirty(row: number): boolean
+     // If dirtyState == DirtyState.FULL, treat all rows as dirty (ignore rowFlags)
 
      // Selection
      selectionRange: SelectionRange | null
-     selectionRows: Set<number>
 
      // Hyperlinks
      hoveredLink: HyperlinkRange | null
-     hyperlinkRows: Set<number>
 
-     // Cursor
+     // Cursor (viewport-relative coordinates)
      cursorX: number
      cursorY: number
      cursorVisible: boolean
      cursorStyle: CursorStyle
 
-     // Grapheme access (for complex clusters)
-     getGraphemeString(row: number, col: number): string
+     // Viewport-relative grapheme lookup (caller maps scrollback/screen)
+     // Returns single codepoint for simple cells; returns '' for invalid coords
+     getGraphemeString(viewportRow: number, col: number): string
 
      // Theme
      theme: TerminalTheme
    }
+
+   // Row flag constants
+   const ROW_DIRTY = 0x01
+   const ROW_HAS_SELECTION = 0x02
+   const ROW_HAS_HYPERLINK = 0x04
 
    interface Renderer {
      attach(canvas: HTMLCanvasElement): void
@@ -114,7 +125,7 @@ ghostty-webgl/
 
 **Tasks:**
 1. WebGL2 context acquisition:
-   - Request with `{ antialias: false, alpha: false }`
+   - Request with `{ antialias: false, alpha: true }` (alpha configurable; default true for transparent themes)
    - Fallback detection if WebGL2 unavailable
    - Context loss event listeners
 
@@ -124,17 +135,32 @@ ghostty-webgl/
    - Grid → NDC transform in vertex shader
 
 3. Background-only instanced draw:
-   - One quad per cell
-   - Instance data: just bgRGBA for now
+   - One quad per cell, scaled by cellSpan for wide characters
+   - Instance data: bgRGBA + cellSpan (u8)
+   - Background quad width = `cellSpan * cellWidth`
+   - Skip draw when `cellSpan == 0` (continuation cell, matches Canvas behavior)
    - Validate dirty-row `bufferSubData` updates
+   - Use `rowFlags & ROW_DIRTY` to decide row uploads (unless dirtyState == FULL)
+
+   **Background vertex shader snippet:**
+   ```glsl
+   // Skip continuation cells (cellSpan == 0)
+   flat out float v_skip;
+   v_skip = a_cellSpan == 0.0 ? 1.0 : 0.0;
+
+   // Scale quad width by cellSpan (1 for normal, 2 for wide)
+   vec2 size = u_cellSize * vec2(max(a_cellSpan, 1.0), 1.0);
+   ```
+
+   Background fragment shader should `discard` when `v_skip > 0.5` (same as glyph pass).
 
 4. Selection overlay:
    - Pre-blend selection color into bgRGBA on CPU
    - Inverse video: swap fg/bg on CPU
 
 5. Scrollback/viewport:
-   - Use `viewportY` to offset into scrollback
-   - Validate composition matches Canvas
+   - Renderer receives pre-composed `viewportCells` (caller handles scrollback composition)
+   - Validate output matches Canvas for scrolled viewports
 
 **Deliverable:** WebGL renderer draws colored backgrounds matching Canvas output.
 
@@ -197,6 +223,8 @@ const CELL_STRIDE = 32
 
 **Key behaviors:**
 - Wide glyphs: leading cell `cellSpan=2`, trailing `cellSpan=0` (skip draw)
+- Background pass: uses `cellSpan` to scale quad width; `cellSpan=0` → discard
+- Glyph pass: uses `cellSpan` to select wide glyph from atlas; `cellSpan=0` → discard
 - Selection: pre-compute blend into bgRGBA
 - Inverse/faint: resolve on CPU into fg/bg/fgA
 - Draw all instances every frame; dirty tracking only minimizes uploads
@@ -204,7 +232,9 @@ const CELL_STRIDE = 32
 **Tasks:**
 1. Implement `CellBuffer` class with typed array view
 2. Implement row-based dirty update with `bufferSubData`
-3. Add `cellSpan` handling in vertex shader (skip if 0)
+   - Use `rowFlags & ROW_DIRTY` to identify rows needing upload
+   - Use `rowFlags & ROW_HAS_SELECTION` for selection pre-blend
+3. Add `cellSpan` handling in vertex shaders (skip if 0, scale width if 2)
 4. Validate dirty-row updates match full-buffer updates
 
 **Deliverable:** Buffer architecture locked, row updates validated.
