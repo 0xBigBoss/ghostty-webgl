@@ -908,3 +908,31 @@ if (uploadTime > 2 && dirtyRowCount < rows * 0.5) {
 ### Browser Compatibility
 - [WebGL2 Browser Support](https://caniuse.com/webgl2) - Current support matrix
 - [Cesium iOS 18.2/18.3 context loss reports](https://community.cesium.com/t/crashing-on-ios-18-2-and-18-3-on-specific-devices/39615) - iPad 9th gen + older devices (Mar 31, 2025)
+
+---
+
+## Appendix: Benchmark Data
+
+**VS Code WebGL PR #84440 Results:**
+
+| Platform | Terminal Size | Speedup vs Canvas2D |
+|----------|---------------|---------------------|
+| Windows | 87×26 | 901% |
+| Windows | 300×80 | 839% |
+| macOS | 300×80 | 314% |
+
+**Related Repositories:**
+
+| Repo | Purpose |
+|------|---------|
+| `0xBigBoss/ghostty` | Zig source fork (WASM build reference) |
+| `0xBigBoss/ghostty-web` | ghostty-web fork (Canvas2D renderer) |
+| `0xBigBoss/vscode-bootty` | VS Code extension (consumer) |
+
+**ghostty-web Exports (reference):**
+- `Terminal` - Main terminal class (xterm.js API compatible)
+- `Ghostty` - WASM wrapper for ghostty-vt runtime
+- `CanvasRenderer` - Canvas2D renderer (to be abstracted)
+- `KeyEncoder` - Keyboard → escape sequences
+- `FitAddon` - Auto-resize terminal to container
+- `SelectionManager`, `LinkDetector`, `InputHandler`
