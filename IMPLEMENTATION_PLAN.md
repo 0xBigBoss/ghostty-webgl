@@ -86,6 +86,7 @@ ghostty-webgl/
      // Cursor (viewport-relative coordinates)
      cursorX: number
      cursorY: number
+     // cursorVisible must already reflect viewport visibility (false when scrolled)
      cursorVisible: boolean
      cursorStyle: CursorStyle
 
@@ -110,6 +111,12 @@ ghostty-webgl/
      dispose(): void
    }
    ```
+
+**RenderInput notes (parity-critical):**
+- `cursorVisible` should be false when `viewportY > 0` (Canvas hides cursor while scrolled).
+- Selection opacity should default to 0.4 (current Canvas behavior). If theme doesn’t expose it, add `selectionOpacity?: number` to `TerminalTheme`.
+- Default background (bg = 0,0,0) should be treated as “transparent to theme background,” except when selected (still draw selection overlay).
+- If `viewportY > 0`, force all rows dirty and rely on scrollback composition for `viewportCells` (matches Canvas behavior).
 
 2. Refactor `CanvasRenderer` to accept `RenderInput`
 
@@ -139,6 +146,7 @@ ghostty-webgl/
    - Instance data: bgRGBA + cellSpan (u8)
    - Background quad width = `cellSpan * cellWidth`
    - Skip draw when `cellSpan == 0` (continuation cell, matches Canvas behavior)
+   - Treat default background as transparent: encode `bgA = 0` when default bg and not selected, then discard in fragment shader
    - Validate dirty-row `bufferSubData` updates
    - Use `rowFlags & ROW_DIRTY` to decide row uploads (unless dirtyState == FULL)
 
@@ -152,10 +160,11 @@ ghostty-webgl/
    vec2 size = u_cellSize * vec2(max(a_cellSpan, 1.0), 1.0);
    ```
 
-   Background fragment shader should `discard` when `v_skip > 0.5` (same as glyph pass).
+   Background fragment shader should `discard` when `v_skip > 0.5` or `bgA == 0` (transparent default bg).
 
 4. Selection overlay:
-   - Pre-blend selection color into bgRGBA on CPU
+   - Pre-blend selection color into bgRGBA on CPU using selectionOpacity (default 0.4)
+   - If `selectionForeground` is defined, override fgRGBA for selected cells
    - Inverse video: swap fg/bg on CPU
 
 5. Scrollback/viewport:
@@ -188,7 +197,7 @@ interface CellInstance {
   // Cell flags (4 bytes)
   cellSpan: u8     // offset 12: 0=skip, 1=normal, 2=wide
   decoFlags: u8    // offset 13: underline|strike|hyperlink
-  glyphFlags: u8   // offset 14: blink|reserved
+  glyphFlags: u8   // offset 14: colorAtlas|blink|reserved
   pad: u8          // offset 15
 
   // Foreground RGBA (4 bytes)
@@ -214,28 +223,89 @@ interface CellInstance {
 }
 
 const CELL_STRIDE = 32
+
+// Glyph flag constants
+const GLYPH_COLOR_ATLAS = 0x01
 ```
 
 **Buffer layout:**
 - Row-major: `buffer[row * cols + col]`
 - Row update: `gl.bufferSubData(target, row * cols * CELL_STRIDE, rowData)`
 - Total size: `rows * cols * 32` bytes (80×24 = 61KB, 300×80 = 768KB)
+- Store atlas rect/size in pixels and normalize in shader by dividing by `u_atlasSize` (avoid normalized-attribute ambiguity).
+- Prefer integer vertex attributes in WebGL2 (`vertexAttribIPointer`) with `flat in uint` flags to avoid float precision issues.
 
 **Key behaviors:**
 - Wide glyphs: leading cell `cellSpan=2`, trailing `cellSpan=0` (skip draw)
 - Background pass: uses `cellSpan` to scale quad width; `cellSpan=0` → discard
 - Glyph pass: uses `cellSpan` to select wide glyph from atlas; `cellSpan=0` → discard
-- Selection: pre-compute blend into bgRGBA
+- Selection: pre-compute blend into bgRGBA; if `selectionForeground` is set, override fgRGBA
 - Inverse/faint: resolve on CPU into fg/bg/fgA
 - Draw all instances every frame; dirty tracking only minimizes uploads
+  - If dirty rows > ~30–50%, upload full buffer to reduce `bufferSubData` overhead
 
 **Tasks:**
 1. Implement `CellBuffer` class with typed array view
 2. Implement row-based dirty update with `bufferSubData`
    - Use `rowFlags & ROW_DIRTY` to identify rows needing upload
    - Use `rowFlags & ROW_HAS_SELECTION` for selection pre-blend
+   - Include rows affected by hover changes (hyperlinks) when setting `rowFlags`
 3. Add `cellSpan` handling in vertex shaders (skip if 0, scale width if 2)
-4. Validate dirty-row updates match full-buffer updates
+4. Use integer vertex attributes for flags and pack `glyphFlags` as `u8`
+5. Validate dirty-row updates match full-buffer updates
+
+**Hyperlink hover change detection (caller responsibility):**
+```typescript
+// Track previous hover state to detect changes
+let previousHoveredHyperlinkId = 0
+let previousHoveredLinkRange: { startY: number; endY: number } | null = null
+
+function computeRowFlags(input: RenderInput): void {
+  const { hoveredLink, rowFlags, viewportCells, cols, rows } = input
+
+  // Detect hyperlink hover changes (OSC8 hyperlinks)
+  const hyperlinkChanged = hoveredLink?.hyperlinkId !== previousHoveredHyperlinkId
+
+  if (hyperlinkChanged) {
+    // Mark rows containing OLD hyperlink as needing redraw
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < cols; x++) {
+        const cell = viewportCells[y * cols + x]
+        if (cell.hyperlink_id === previousHoveredHyperlinkId ||
+            cell.hyperlink_id === hoveredLink?.hyperlinkId) {
+          rowFlags[y] |= ROW_DIRTY | ROW_HAS_HYPERLINK
+          break
+        }
+      }
+    }
+    previousHoveredHyperlinkId = hoveredLink?.hyperlinkId ?? 0
+  }
+
+  // Detect regex link range changes
+  const rangeChanged = !rangesEqual(hoveredLink?.range, previousHoveredLinkRange)
+  if (rangeChanged) {
+    // Mark rows in OLD range
+    if (previousHoveredLinkRange) {
+      for (let y = previousHoveredLinkRange.startY; y <= previousHoveredLinkRange.endY; y++) {
+        if (y >= 0 && y < rows) rowFlags[y] |= ROW_DIRTY | ROW_HAS_HYPERLINK
+      }
+    }
+    // Mark rows in NEW range
+    if (hoveredLink?.range) {
+      for (let y = hoveredLink.range.startY; y <= hoveredLink.range.endY; y++) {
+        if (y >= 0 && y < rows) rowFlags[y] |= ROW_DIRTY | ROW_HAS_HYPERLINK
+      }
+    }
+    previousHoveredLinkRange = hoveredLink?.range ?? null
+  }
+}
+```
+
+**Adjacent row handling for glyph overflow:**
+- Complex scripts (Devanagari, Arabic) may have glyphs that extend into adjacent rows
+- Canvas renderer includes y±1 when marking dirty rows
+- WebGL approach: always draw all glyphs (no clipping); dirty tracking only affects uploads
+- If adjacent row artifacts appear, extend `rowFlags` marking to include y-1, y+1 for dirty rows
 
 **Deliverable:** Buffer architecture locked, row updates validated.
 
@@ -256,9 +326,9 @@ interface GlyphMetrics {
   atlasW: number
   atlasH: number
 
-  // Bearing relative to cell origin (for overflow)
-  bearingX: number  // left edge offset from cell left
-  bearingY: number  // top edge offset from cell baseline
+  // Bearing relative to cell origin/baseline (for overflow)
+  bearingX: number  // left side bearing from cell origin (pixels, signed)
+  bearingY: number  // distance from baseline to glyph top (pixels, signed)
 
   // Actual glyph dimensions
   width: number
@@ -271,6 +341,47 @@ interface GlyphMetrics {
    - Offscreen canvas for rasterization
    - 2D bin-packing for glyph placement
    - Measure bearing via canvas `measureText()` + manual baseline calc
+   - Define bearing convention explicitly and keep shader math consistent (baseline + sign)
+   - Validate bearing math against Canvas `fillText` for a small glyph set
+
+**Bearing convention (critical for overflow glyphs):**
+```typescript
+// Canvas measureText returns:
+// - actualBoundingBoxLeft: distance from alignment point LEFT to left edge (positive = extends left)
+// - actualBoundingBoxAscent: distance from baseline UP to top edge (positive = above baseline)
+
+// Convert to our convention:
+interface GlyphBearing {
+  bearingX: number  // Pixels from cell left edge to glyph left edge (positive = shift right)
+  bearingY: number  // Pixels from baseline to glyph TOP (positive = above baseline)
+}
+
+function measureGlyph(ctx: CanvasRenderingContext2D, char: string): GlyphBearing {
+  const metrics = ctx.measureText(char)
+
+  // bearingX: negative actualBoundingBoxLeft means glyph starts LEFT of origin
+  // We want: positive = glyph starts to the right of cell origin
+  const bearingX = -metrics.actualBoundingBoxLeft
+
+  // bearingY: actualBoundingBoxAscent is distance from baseline UP
+  // We store this directly (positive = glyph top is above baseline)
+  const bearingY = metrics.actualBoundingBoxAscent
+
+  return { bearingX, bearingY }
+}
+
+// Shader usage (vertex):
+// glyphTopLeft = cellOrigin + vec2(0, baseline) + vec2(bearingX, -bearingY)
+// Note: Y is negated because screen Y increases downward
+```
+
+**Validation set for bearing math:**
+- `M` - standard baseline character
+- `g` - descender below baseline
+- `ि` (Devanagari vowel sign I) - extends LEFT of origin
+- `ై` (Telugu vowel sign AI) - extends above baseline
+- `🎉` - emoji (wide, no bearing issues)
+- Verify each renders identically to Canvas `fillText`
 
 2. ASCII prewarm:
    - Pre-render chars 32-126 on init (normal, bold, italic variants)
@@ -283,10 +394,13 @@ interface GlyphMetrics {
 4. Separate RGBA atlas for color emoji:
    - Detect emoji ranges, route to color atlas
    - Separate texture unit in shader
+   - Add `GLYPH_COLOR_ATLAS` flag in `glyphFlags`
+   - Use premultiplied alpha for emoji uploads (`UNPACK_PREMULTIPLY_ALPHA_WEBGL = true`)
 
 5. Re-rasterize on DPR/font changes:
    - Listen for `matchMedia('resolution')` changes
    - Clear atlas and rebuild
+   - Safari fallback: if `OffscreenCanvas` or `actualBoundingBox*` unavailable, use in-DOM canvas + conservative metrics
 
 **Deliverable:** Atlas renders glyphs with correct metrics, handles graphemes.
 
@@ -309,20 +423,23 @@ precision highp float;
 in vec2 a_position;  // 0,0 to 1,1
 
 // Per-instance (from CellInstance buffer)
-in vec2 a_atlasRect;   // atlasX, atlasY (normalized)
-in vec2 a_atlasSize;   // atlasW, atlasH (normalized)
+in vec2 a_atlasRect;   // atlasX, atlasY (pixels)
+in vec2 a_atlasSize;   // atlasW, atlasH (pixels)
 in vec2 a_bearing;     // bearingX, bearingY (pixels)
 in float a_cellSpan;   // 0=skip, 1=normal, 2=wide
+in float a_glyphFlags; // bitfield (GLYPH_COLOR_ATLAS, ...)
 in vec4 a_fgColor;     // fgRGBA
 
 // Uniforms
 uniform vec2 u_cellSize;    // cell dimensions in pixels
 uniform vec2 u_gridSize;    // terminal cols, rows
-uniform vec2 u_atlasSize;   // atlas texture dimensions
+uniform vec2 u_atlasSize;   // atlas texture dimensions (pixels)
+uniform float u_baseline;   // baseline offset from cell top (pixels)
 
 out vec2 v_texCoord;
 out vec4 v_fgColor;
 flat out float v_skip;
+flat out float v_colorAtlas;
 
 void main() {
   // Skip if cellSpan == 0 (wide char continuation)
@@ -335,9 +452,10 @@ void main() {
   // Cell origin in pixels (top-left)
   vec2 cellOrigin = vec2(float(col), float(row)) * u_cellSize;
 
-  // Glyph quad position using bearing and atlas size
-  vec2 glyphSize = a_atlasSize * u_atlasSize;
-  vec2 glyphPos = cellOrigin + a_bearing + a_position * glyphSize;
+  // Glyph quad position using bearing + baseline
+  vec2 glyphSize = a_atlasSize;
+  vec2 baselineOrigin = cellOrigin + vec2(0.0, u_baseline);
+  vec2 glyphPos = baselineOrigin + vec2(a_bearing.x, -a_bearing.y) + a_position * glyphSize;
 
   // Convert to NDC (assuming viewport matches canvas)
   vec2 canvasSize = u_gridSize * u_cellSize;
@@ -347,8 +465,9 @@ void main() {
   gl_Position = vec4(ndc, 0.0, 1.0);
 
   // Texture coordinates
-  v_texCoord = a_atlasRect + a_position * a_atlasSize;
+  v_texCoord = (a_atlasRect + a_position * a_atlasSize) / u_atlasSize;
   v_fgColor = a_fgColor;
+  v_colorAtlas = mod(a_glyphFlags, 2.0); // GLYPH_COLOR_ATLAS = bit 0
 }
 ```
 
@@ -358,18 +477,25 @@ void main() {
 precision highp float;
 
 uniform sampler2D u_atlas;
+uniform sampler2D u_colorAtlas;
 
 in vec2 v_texCoord;
 in vec4 v_fgColor;
 flat in float v_skip;
+flat in float v_colorAtlas;
 
 out vec4 fragColor;
 
 void main() {
   if (v_skip > 0.5) discard;
 
-  float alpha = texture(u_atlas, v_texCoord).a;
-  fragColor = vec4(v_fgColor.rgb, v_fgColor.a * alpha);
+  if (v_colorAtlas > 0.5) {
+    vec4 rgba = texture(u_colorAtlas, v_texCoord);
+    fragColor = vec4(rgba.rgb, rgba.a * v_fgColor.a);
+  } else {
+    float alpha = texture(u_atlas, v_texCoord).a;
+    fragColor = vec4(v_fgColor.rgb, v_fgColor.a * alpha);
+  }
 }
 ```
 
@@ -378,6 +504,7 @@ void main() {
 2. Implement glyph pass (bearing-offset quads)
 3. Validate glyph overflow renders correctly
 4. Handle wide glyphs (`cellSpan=2` uses double-width atlas entry)
+5. Use premultiplied-alpha blending globally: `gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA)`
 
 **Deliverable:** Text renders with correct overflow, no clipping.
 
@@ -433,6 +560,11 @@ void main() {
 - Memory: atlas texture size + instance buffer size
 - Targets: Chrome, Firefox, Safari, VS Code webview
 
+**Browser guardrails (WebKit/Safari):**
+- Validate `OffscreenCanvas` availability; fallback to in-DOM canvas for atlas rasterization.
+- Use `R8`/`RED` or `RGBA` explicitly for glyph atlas (avoid legacy `ALPHA` formats).
+- Ensure integer vertex attributes are converted correctly (use `vertexAttribPointer` with `normalized=false` or explicit casts).
+
 **Tasks:**
 1. Implement context loss handlers
 2. Add renderer auto-detection and fallback
@@ -440,6 +572,155 @@ void main() {
 4. Document results and any regressions
 
 **Deliverable:** Production-ready WebGL renderer shipping in vscode-bootty.
+
+---
+
+### Cross-Platform WebGL2 Best Practices
+
+**Texture configuration (critical for Safari):**
+```typescript
+// Pixel store settings - set BEFORE texImage2D/texSubImage2D
+gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1)           // Glyph atlas rows may not be 4-byte aligned
+gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false)    // Canvas origin matches WebGL (top-left)
+gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true)  // For color emoji atlas only
+
+// Validate max texture size before atlas allocation
+const maxSize = gl.getParameter(gl.MAX_TEXTURE_SIZE)  // Typically 4096-16384
+if (atlasSize > maxSize) {
+  // Use multiple smaller atlases or reduce glyph cache
+}
+```
+
+**Texture format selection:**
+| Atlas Type | Internal Format | Format | Type | Notes |
+|------------|----------------|--------|------|-------|
+| Glyph (grayscale) | `R8` | `RED` | `UNSIGNED_BYTE` | WebGL2 standard; Safari OK |
+| Color emoji | `RGBA8` | `RGBA` | `UNSIGNED_BYTE` | Premultiplied alpha |
+| Fallback (WebGL1 compat) | `LUMINANCE` | `LUMINANCE` | `UNSIGNED_BYTE` | Avoid; prefer R8 |
+
+**sRGB color space handling:**
+- WebGL2 framebuffer is linear by default; CSS/Canvas colors are sRGB.
+- For accurate color reproduction, either:
+  - Convert theme colors to linear on CPU: `linear = pow(srgb, 2.2)`
+  - Or request sRGB framebuffer: `gl.enable(gl.FRAMEBUFFER_SRGB)` (check extension)
+- For MVP: skip sRGB correction; visual difference is minor for terminal colors.
+
+**Buffer streaming for dirty row updates:**
+```typescript
+// Option 1: bufferSubData (simple, works everywhere)
+gl.bufferSubData(gl.ARRAY_BUFFER, rowOffset, rowData)
+
+// Option 2: Buffer orphaning (better for frequent partial updates)
+// Re-allocate buffer with null, then subdata - avoids GPU stall
+if (dirtyRowCount > rows * 0.5) {
+  gl.bufferData(gl.ARRAY_BUFFER, fullBuffer, gl.DYNAMIC_DRAW)
+} else {
+  gl.bufferSubData(gl.ARRAY_BUFFER, rowOffset, rowData)
+}
+
+// Threshold: if >50% rows dirty, upload full buffer (fewer driver calls)
+```
+
+**Integer vertex attributes (WebGL2):**
+```glsl
+// Vertex shader: use flat integers for flags
+layout(location = 3) in uint a_flags;  // cellSpan | decoFlags | glyphFlags packed
+flat out uint v_flags;
+
+void main() {
+  uint cellSpan = a_flags & 0xFFu;
+  uint decoFlags = (a_flags >> 8u) & 0xFFu;
+  // ...
+}
+```
+```typescript
+// JavaScript: use vertexAttribIPointer for integers (not vertexAttribPointer)
+gl.vertexAttribIPointer(3, 1, gl.UNSIGNED_INT, stride, offset)
+gl.enableVertexAttribArray(3)
+gl.vertexAttribDivisor(3, 1)  // Per-instance
+```
+
+**Context loss recovery checklist:**
+1. `webglcontextlost`: `event.preventDefault()`, set `contextValid = false`
+2. `webglcontextrestored`:
+   - Re-create all WebGL resources (programs, buffers, textures, VAOs)
+   - Re-upload glyph atlas from cached Canvas data
+   - Re-upload instance buffer (full buffer)
+   - Set `contextValid = true`, trigger full redraw
+3. Track consecutive failures; after 3, fallback permanently to Canvas
+
+---
+
+### Validation Test Harness
+
+**Pixel-diff regression tests:**
+```typescript
+// Test harness structure
+interface RenderTestCase {
+  name: string
+  input: RenderInput
+  expectedCanvas: HTMLCanvasElement  // Reference from CanvasRenderer
+}
+
+async function validateParity(webgl: WebGLRenderer, canvas: CanvasRenderer, testCase: RenderTestCase) {
+  // Render both
+  webgl.render(testCase.input)
+  canvas.render(testCase.input)
+
+  // Extract pixels
+  const webglPixels = getCanvasPixels(webgl.canvas)
+  const canvasPixels = getCanvasPixels(canvas.canvas)
+
+  // Compare with tolerance (anti-aliasing may differ slightly)
+  const diff = pixelDiff(webglPixels, canvasPixels, { threshold: 0.1 })
+  assert(diff.percentDifferent < 0.5, `${testCase.name}: ${diff.percentDifferent}% pixels differ`)
+}
+
+// Critical test cases:
+const PARITY_TESTS: RenderTestCase[] = [
+  { name: 'selection-opacity', /* ... */ },        // Selection with 0.4 opacity
+  { name: 'inverse-video', /* ... */ },            // INVERSE flag
+  { name: 'wide-chars', /* ... */ },               // CJK characters (cellSpan=2)
+  { name: 'emoji-color', /* ... */ },              // Color emoji rendering
+  { name: 'devanagari-overflow', /* ... */ },      // Glyphs extending left
+  { name: 'scrolled-cursor-hidden', /* ... */ },   // Cursor hidden when scrolled
+  { name: 'default-bg-transparent', /* ... */ },   // Theme background shows through
+  { name: 'hyperlink-underline', /* ... */ },      // Blue underline on hover
+]
+```
+
+**Safari smoke test checklist:**
+- [ ] Context acquisition succeeds (`canvas.getContext('webgl2')` not null)
+- [ ] R8 texture format works (glyph atlas renders)
+- [ ] Integer vertex attributes work (`vertexAttribIPointer`)
+- [ ] Premultiplied alpha blending correct (emoji not washed out)
+- [ ] OffscreenCanvas fallback works (or in-DOM canvas used)
+- [ ] No console warnings about deprecated features
+- [ ] Performance: 60fps on 80×24 terminal
+- [ ] Context loss recovery works (simulate via WebGL Inspector)
+
+**Performance guardrails:**
+```typescript
+// Track frame time and warn on regression
+const FRAME_BUDGET_MS = 16.67  // 60fps
+const frameStart = performance.now()
+renderer.render(input)
+const frameTime = performance.now() - frameStart
+
+if (frameTime > FRAME_BUDGET_MS * 2) {
+  console.warn(`Frame took ${frameTime.toFixed(1)}ms (budget: ${FRAME_BUDGET_MS}ms)`)
+}
+
+// Track dirty row upload efficiency
+const uploadStart = performance.now()
+cellBuffer.updateDirtyRows(rowFlags)
+const uploadTime = performance.now() - uploadStart
+
+// If upload takes >2ms, consider full buffer strategy
+if (uploadTime > 2 && dirtyRowCount < rows * 0.5) {
+  console.debug('Consider full buffer upload for better perf')
+}
+```
 
 ---
 
