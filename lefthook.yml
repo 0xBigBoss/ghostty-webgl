@@ -1,0 +1,20 @@
+pre-commit:
+  parallel: true
+  commands:
+    oxlint:
+      glob: "*.{ts,tsx,js,jsx}"
+      run: bunx oxlint {staged_files}
+    oxfmt:
+      glob: "*.{ts,tsx,js,jsx,json}"
+      run: bunx oxfmt --check {staged_files}
+    typecheck:
+      glob: "*.{ts,tsx}"
+      run: bun run typecheck
+
+pre-push:
+  parallel: true
+  commands:
+    knip:
+      run: bun run knip
+    cpd:
+      run: bun run cpd

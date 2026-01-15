@@ -1,0 +1,27 @@
+{
+  "name": "ghostty-webgl",
+  "version": "0.0.1",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "bun run --filter '*' build",
+    "test": "bun run --filter '*' test",
+    "typecheck": "tsgo --build",
+    "lint": "oxlint .",
+    "fmt": "oxfmt .",
+    "fmt:check": "oxfmt --check .",
+    "knip": "knip",
+    "cpd": "jscpd packages/",
+    "prepare": "lefthook install"
+  },
+  "devDependencies": {
+    "@typescript/native-preview": "7.0.0-dev.20260114.1",
+    "jscpd": "4.0.7",
+    "knip": "5.81.0",
+    "lefthook": "2.0.15",
+    "oxfmt": "0.24.0",
+    "oxlint": "1.39.0"
+  }
+}

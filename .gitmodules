@@ -1,0 +1,6 @@
+[submodule "ghostty"]
+	path = ghostty
+	url = https://github.com/0xBigBoss/ghostty.git
+[submodule "packages/ghostty-web"]
+	path = packages/ghostty-web
+	url = https://github.com/0xBigBoss/ghostty-web.git
