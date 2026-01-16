@@ -13,12 +13,13 @@ Replace Canvas2D rendering in ghostty-web with WebGL2 for 50-100% throughput imp
 - Phase 4: Glyph atlas + shelf packing + ASCII prewarm + LRU-style rebuild on overflow
 - Phase 5: Text pass with overflow-safe quads and premultiplied alpha
 - Phase 6: Decorations (underline/strikethrough/hyperlink) + cursor + scrollbar
+- Added `vscode-bootty` as a submodule for tight integration and testing
 
 **Partial / remaining:**
 - Curly underline flag not wired (no flag source yet)
 - Context loss handling exists in WebGLRenderer but **fallback to Canvas** is not wired
 - Benchmarks + parity validation in downstream consumer (BooTTY) still pending
-- BooTTY integration (webview wiring, settings, QA) not started in this repo yet
+- BooTTY integration (webview wiring, settings, QA) not implemented yet
 
 ## Updated Execution Plan (includes BooTTY integration)
 
@@ -39,28 +40,47 @@ Replace Canvas2D rendering in ghostty-web with WebGL2 for 50-100% throughput imp
 ### B. BooTTY (VS Code extension integration)
 1. **Dependency alignment**  
    - Update BooTTY to the new `@0xbigboss/ghostty-web` build  
-   - Decide delivery for `@0xbigboss/libghostty-webgl`:
-     - Option 1: bundle into webview builds (preferred)
-     - Option 2: load via separate UMD script + CSP/localResourceRoots updates
+   - Add `@0xbigboss/libghostty-webgl` dependency  
+   - Prefer bundling in webview builds (no extra CSP/script tags)
 
-2. **Webview wiring**  
-   - Editor webview: create `WebGLRenderer` if WebGL2 available, pass via `renderer` option  
-   - Panel webview: same for each terminal instance  
-   - Fallback to CanvasRenderer when unavailable or if init fails
+2. **Renderer selection plumbing**  
+   - Add `bootty.renderer` setting (`auto` | `webgl` | `canvas`)  
+   - Extend `RuntimeConfig` and `update-config` messaging to carry renderer mode  
+   - Default to `auto` and allow forced `canvas` for support/debugging
 
-3. **User-facing settings**  
-   - Add `bootty.renderer` or `bootty.webgl` setting:
-     - `auto` (default), `webgl`, `canvas`
-   - Expose in config + hot-reload behavior
+3. **Webview wiring (editor + panel)**  
+   - In `src/webview/main.ts` and `src/webview/panel-main.ts`:
+     - Detect WebGL2 (`canvas.getContext("webgl2")`)  
+     - If allowed by setting, create `new WebGLRenderer({ onContextLoss })`  
+     - Pass renderer via `new Terminal({ renderer })`  
+     - Fall back to CanvasRenderer when unavailable or init fails  
+   - Ensure both webviews share identical renderer selection logic
 
-4. **Context loss fallback**  
-   - On repeated context loss, recreate terminal using CanvasRenderer  
-   - Provide telemetry/logging (console) for diagnostics
+4. **Renderer status validation**  
+   - Webview sends `renderer-status` message on init and on fallback  
+   - Extension logs to Output Channel + optional status bar item  
+   - Add `BooTTY: Renderer Info` command to surface status to users
 
-5. **Validation + perf**  
+5. **Context loss fallback**  
+   - In WebGLRenderer `onContextLoss`, notify extension and swap to Canvas  
+   - Recreate terminal instance (or renderer) in webview after N failures  
+   - Preserve scrollback where possible (best-effort)
+
+6. **Validation + perf**  
    - Add a repeatable benchmark harness in BooTTY  
    - Update QA checklist to include WebGL parity + fallback behavior  
    - Record performance deltas vs Canvas (MiB/s, frame time)
+
+### BooTTY Integration Checklist (concrete file targets)
+1. `vscode-bootty/package.json`: add dependency on `@0xbigboss/libghostty-webgl`
+2. `vscode-bootty/esbuild.config.mjs`: confirm webview bundle includes WebGL renderer
+3. `vscode-bootty/src/types/messages.ts`: add renderer config + renderer-status messages
+4. `vscode-bootty/src/extension.ts` (or config owner): read `bootty.renderer` and send to webviews
+5. `vscode-bootty/src/webview/main.ts`: implement renderer selection + status reporting
+6. `vscode-bootty/src/webview/panel-main.ts`: same as editor webview
+7. `vscode-bootty/src/webview/template.html` + `panel-template.html`: no changes if bundling
+8. `vscode-bootty/QA.md`: add WebGL2 parity + fallback checklist
+9. Optional: `vscode-bootty/README.md`: document renderer setting and status command
 
 **Deliverable:** BooTTY runs WebGL2 renderer by default (auto), with measurable gains and reliable fallback.
 
