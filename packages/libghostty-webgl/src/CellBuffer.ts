@@ -1,3 +1,4 @@
+import debug from "debug";
 import {
   CellFlags,
   DirtyState,
@@ -5,11 +6,16 @@ import {
   ROW_HAS_HYPERLINK,
   ROW_HAS_SELECTION,
   type GhosttyCell,
-  type HyperlinkRange,
   type RenderInput,
   type TerminalTheme,
 } from "./types";
 import type { GlyphAtlas, GlyphMetrics } from "./GlyphAtlas";
+
+const logProfile = debug("bootty:webgl:cellbuffer");
+
+interface WindowWithProfile extends Window {
+  __WEBGL_PROFILE__?: boolean;
+}
 
 const CELL_STRIDE = 32;
 const GLYPH_COLOR_ATLAS = 0x01;
@@ -20,6 +26,24 @@ const DECO_HYPERLINK = 0x04;
 const _DECO_CURLY = 0x08;
 
 const LINK_COLOR = { r: 74, g: 144, b: 226, a: 255 };
+const ASCII_CACHE: string[] = Array.from({ length: 128 }, (_, i) => String.fromCharCode(i));
+const SPACE_CODEPOINT = 32;
+
+interface ResolvedCellColors {
+  fgR: number;
+  fgG: number;
+  fgB: number;
+  fgA: number;
+  bgR: number;
+  bgG: number;
+  bgB: number;
+  bgA: number;
+  decoR: number;
+  decoG: number;
+  decoB: number;
+  decoA: number;
+  decoFlags: number;
+}
 
 export class CellBuffer {
   private gl: WebGL2RenderingContext;
@@ -29,6 +53,7 @@ export class CellBuffer {
   private data: ArrayBuffer = new ArrayBuffer(0);
   private u8: Uint8Array = new Uint8Array(0);
   private view: DataView = new DataView(new ArrayBuffer(0));
+  private resolved: ResolvedCellColors = createResolvedColors();
 
   constructor(gl: WebGL2RenderingContext) {
     this.gl = gl;
@@ -57,6 +82,8 @@ export class CellBuffer {
     this.gl.bufferData(this.gl.ARRAY_BUFFER, totalBytes, this.gl.DYNAMIC_DRAW);
   }
 
+  private static profileData = { writeRows: 0, upload: 0, frames: 0, dirtyRowsTotal: 0 };
+
   update(input: RenderInput, atlas: GlyphAtlas, forceFullUpload: boolean): void {
     if (input.cols !== this.cols || input.rows !== this.rows) {
       this.resize(input.cols, input.rows);
@@ -80,9 +107,15 @@ export class CellBuffer {
 
     if (dirtyRows.length === 0) return;
 
+    const PROFILE =
+      typeof window !== "undefined" && (window as WindowWithProfile).__WEBGL_PROFILE__;
+    const t0 = PROFILE ? performance.now() : 0;
+
     for (const row of dirtyRows) {
       this.writeRow(row, input, atlas);
     }
+
+    const t1 = PROFILE ? performance.now() : 0;
 
     this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.buffer);
     const rowSize = cols * CELL_STRIDE;
@@ -98,17 +131,82 @@ export class CellBuffer {
         );
       }
     }
+
+    if (PROFILE) {
+      const t2 = performance.now();
+      CellBuffer.profileData.writeRows += t1 - t0;
+      CellBuffer.profileData.upload += t2 - t1;
+      CellBuffer.profileData.frames++;
+      CellBuffer.profileData.dirtyRowsTotal += dirtyRows.length;
+
+      if (CellBuffer.profileData.frames >= 10) {
+        const d = CellBuffer.profileData;
+        const avgDirty = d.dirtyRowsTotal / d.frames;
+        logProfile(
+          "%d frames, avg %s dirty rows: writeRows=%sms upload=%sms",
+          d.frames,
+          avgDirty.toFixed(1),
+          (d.writeRows / d.frames).toFixed(2),
+          (d.upload / d.frames).toFixed(2),
+        );
+        CellBuffer.profileData = { writeRows: 0, upload: 0, frames: 0, dirtyRowsTotal: 0 };
+      }
+    }
   }
 
   private writeRow(row: number, input: RenderInput, atlas: GlyphAtlas): void {
     const cols = input.cols;
     const rowOffset = row * cols * CELL_STRIDE;
+    const rowBase = row * cols;
     const selectionRange = input.selectionRange;
     const hovered = input.hoveredLink;
     const theme = input.theme;
+    const resolved = this.resolved;
+    const hoveredId = hovered?.hyperlinkId ?? 0;
+
+    let selStart = -1;
+    let selEnd = -1;
+    if (selectionRange && row >= selectionRange.startRow && row <= selectionRange.endRow) {
+      if (selectionRange.startRow === selectionRange.endRow) {
+        selStart = selectionRange.startCol;
+        selEnd = selectionRange.endCol;
+      } else if (row === selectionRange.startRow) {
+        selStart = selectionRange.startCol;
+        selEnd = cols - 1;
+      } else if (row === selectionRange.endRow) {
+        selStart = 0;
+        selEnd = selectionRange.endCol;
+      } else {
+        selStart = 0;
+        selEnd = cols - 1;
+      }
+    }
+    const hasSelection = selStart >= 0;
+
+    let hoverStart = -1;
+    let hoverEnd = -1;
+    if (hoveredId === 0 && hovered?.range) {
+      const range = hovered.range;
+      if (row >= range.startY && row <= range.endY) {
+        if (range.startY === range.endY) {
+          hoverStart = range.startX;
+          hoverEnd = range.endX;
+        } else if (row === range.startY) {
+          hoverStart = range.startX;
+          hoverEnd = cols - 1;
+        } else if (row === range.endY) {
+          hoverStart = 0;
+          hoverEnd = range.endX;
+        } else {
+          hoverStart = 0;
+          hoverEnd = cols - 1;
+        }
+      }
+    }
+    const hasHoverRange = hoverStart >= 0;
 
     for (let col = 0; col < cols; col++) {
-      const cell = input.viewportCells[row * cols + col];
+      const cell = input.viewportCells[rowBase + col];
       const offset = rowOffset + col * CELL_STRIDE;
       if (!cell) {
         this.writeEmptyCell(offset);
@@ -116,31 +214,38 @@ export class CellBuffer {
       }
 
       const cellSpan = cell.width === 0 ? 0 : cell.width;
-      const isSelected = selectionRange ? isInSelection(col, row, selectionRange) : false;
+      const isSelected = hasSelection && col >= selStart && col <= selEnd;
       const isHovered =
-        (hovered?.hyperlinkId ?? 0) > 0
-          ? cell.hyperlink_id === hovered?.hyperlinkId
-          : hovered?.range
-            ? isInLinkRange(col, row, hovered.range)
-            : false;
+        hoveredId > 0
+          ? cell.hyperlink_id === hoveredId
+          : hasHoverRange && col >= hoverStart && col <= hoverEnd;
 
-      const { fg, bg, fgA, bgA, decoColor, decoFlags } = resolveCellColors(
-        cell,
-        theme,
-        isSelected,
-        isHovered,
-      );
+      resolveCellColors(cell, theme, isSelected, isHovered, resolved);
 
       let glyphFlags = 0;
       let atlasMetrics: GlyphMetrics | null = null;
-      if (cellSpan > 0 && fgA > 0 && !(cell.flags & CellFlags.INVISIBLE)) {
-        let grapheme: string;
+      if (cellSpan > 0 && resolved.fgA > 0 && !(cell.flags & CellFlags.INVISIBLE)) {
+        let grapheme = "";
+        let hasGlyph = false;
         if (cell.grapheme_len > 0) {
           grapheme = input.getGraphemeString(row, col);
+          if (grapheme.length === 1) {
+            hasGlyph = grapheme.charCodeAt(0) > SPACE_CODEPOINT;
+          } else {
+            hasGlyph = grapheme.trim().length > 0;
+          }
         } else {
-          grapheme = String.fromCodePoint(cell.codepoint || 32);
+          const codepoint = cell.codepoint || SPACE_CODEPOINT;
+          if (codepoint > SPACE_CODEPOINT) {
+            grapheme =
+              codepoint < ASCII_CACHE.length
+                ? ASCII_CACHE[codepoint]
+                : String.fromCodePoint(codepoint);
+            hasGlyph = true;
+          }
         }
-        if (grapheme.trim().length > 0) {
+
+        if (hasGlyph) {
           const bold = (cell.flags & CellFlags.BOLD) !== 0;
           const italic = (cell.flags & CellFlags.ITALIC) !== 0;
           atlasMetrics = atlas.getGlyph(grapheme, bold, italic);
@@ -164,25 +269,22 @@ export class CellBuffer {
       this.view.setInt16(offset + 8, clampI16(bearingX), true);
       this.view.setInt16(offset + 10, clampI16(bearingY), true);
 
-      this.u8[offset + 12] = cellSpan & 0xff;
-      this.u8[offset + 13] = decoFlags & 0xff;
-      this.u8[offset + 14] = glyphFlags & 0xff;
-      this.u8[offset + 15] = 0;
-
-      this.u8[offset + 16] = fg.r;
-      this.u8[offset + 17] = fg.g;
-      this.u8[offset + 18] = fg.b;
-      this.u8[offset + 19] = fgA;
-
-      this.u8[offset + 20] = bg.r;
-      this.u8[offset + 21] = bg.g;
-      this.u8[offset + 22] = bg.b;
-      this.u8[offset + 23] = bgA;
-
-      this.u8[offset + 24] = decoColor.r;
-      this.u8[offset + 25] = decoColor.g;
-      this.u8[offset + 26] = decoColor.b;
-      this.u8[offset + 27] = decoColor.a;
+      this.view.setUint32(offset + 12, packU8x4(cellSpan, resolved.decoFlags, glyphFlags, 0), true);
+      this.view.setUint32(
+        offset + 16,
+        packU8x4(resolved.fgR, resolved.fgG, resolved.fgB, resolved.fgA),
+        true,
+      );
+      this.view.setUint32(
+        offset + 20,
+        packU8x4(resolved.bgR, resolved.bgG, resolved.bgB, resolved.bgA),
+        true,
+      );
+      this.view.setUint32(
+        offset + 24,
+        packU8x4(resolved.decoR, resolved.decoG, resolved.decoB, resolved.decoA),
+        true,
+      );
 
       this.view.setUint32(offset + 28, 0, true);
     }
@@ -195,47 +297,12 @@ export class CellBuffer {
     this.view.setUint16(offset + 6, 0, true);
     this.view.setInt16(offset + 8, 0, true);
     this.view.setInt16(offset + 10, 0, true);
-    this.u8[offset + 12] = 1;
-    this.u8[offset + 13] = 0;
-    this.u8[offset + 14] = 0;
-    this.u8[offset + 15] = 0;
-    this.u8[offset + 16] = 0;
-    this.u8[offset + 17] = 0;
-    this.u8[offset + 18] = 0;
-    this.u8[offset + 19] = 0;
-    this.u8[offset + 20] = 0;
-    this.u8[offset + 21] = 0;
-    this.u8[offset + 22] = 0;
-    this.u8[offset + 23] = 0;
-    this.u8[offset + 24] = 0;
-    this.u8[offset + 25] = 0;
-    this.u8[offset + 26] = 0;
-    this.u8[offset + 27] = 0;
+    this.view.setUint32(offset + 12, packU8x4(1, 0, 0, 0), true);
+    this.view.setUint32(offset + 16, 0, true);
+    this.view.setUint32(offset + 20, 0, true);
+    this.view.setUint32(offset + 24, 0, true);
     this.view.setUint32(offset + 28, 0, true);
   }
-}
-
-function isInSelection(
-  x: number,
-  y: number,
-  sel: NonNullable<RenderInput["selectionRange"]>,
-): boolean {
-  const { startCol, startRow, endCol, endRow } = sel;
-  if (startRow === endRow) {
-    return y === startRow && x >= startCol && x <= endCol;
-  }
-  if (y === startRow) return x >= startCol;
-  if (y === endRow) return x <= endCol;
-  return y > startRow && y < endRow;
-}
-
-function isInLinkRange(x: number, y: number, range: HyperlinkRange["range"]): boolean {
-  if (!range) return false;
-  return (
-    (y === range.startY && x >= range.startX && (y < range.endY || x <= range.endX)) ||
-    (y > range.startY && y < range.endY) ||
-    (y === range.endY && x <= range.endX && (y > range.startY || x >= range.startX))
-  );
 }
 
 function resolveCellColors(
@@ -243,21 +310,25 @@ function resolveCellColors(
   theme: TerminalTheme,
   isSelected: boolean,
   isHovered: boolean,
-): {
-  fg: { r: number; g: number; b: number };
-  bg: { r: number; g: number; b: number };
-  fgA: number;
-  bgA: number;
-  decoColor: { r: number; g: number; b: number; a: number };
-  decoFlags: number;
-} {
-  let fg = { r: cell.fg_r, g: cell.fg_g, b: cell.fg_b };
-  let bg = { r: cell.bg_r, g: cell.bg_g, b: cell.bg_b };
+  out: ResolvedCellColors,
+): void {
+  let fgR = cell.fg_r;
+  let fgG = cell.fg_g;
+  let fgB = cell.fg_b;
+  let bgR = cell.bg_r;
+  let bgG = cell.bg_g;
+  let bgB = cell.bg_b;
 
   if (cell.flags & CellFlags.INVERSE) {
-    const tmp = fg;
-    fg = bg;
-    bg = tmp;
+    const tmpR = fgR;
+    const tmpG = fgG;
+    const tmpB = fgB;
+    fgR = bgR;
+    fgG = bgG;
+    fgB = bgB;
+    bgR = tmpR;
+    bgG = tmpG;
+    bgB = tmpB;
   }
 
   let fgA = 255;
@@ -267,22 +338,23 @@ function resolveCellColors(
     fgA = 128;
   }
 
-  const isDefaultBg = bg.r === 0 && bg.g === 0 && bg.b === 0;
+  const isDefaultBg = bgR === 0 && bgG === 0 && bgB === 0;
   let bgA = isDefaultBg ? 0 : 255;
 
   if (isSelected) {
     const selectionOpacity = clampAlpha(theme.selectionOpacity * theme.selectionBackground.a);
-    const baseBg = isDefaultBg
-      ? { r: theme.background.r, g: theme.background.g, b: theme.background.b }
-      : bg;
-    bg = blendRgb(baseBg, theme.selectionBackground, selectionOpacity);
+    const baseR = isDefaultBg ? theme.background.r : bgR;
+    const baseG = isDefaultBg ? theme.background.g : bgG;
+    const baseB = isDefaultBg ? theme.background.b : bgB;
+    const inv = 1 - selectionOpacity;
+    bgR = clampU8(Math.round(baseR * inv + theme.selectionBackground.r * selectionOpacity));
+    bgG = clampU8(Math.round(baseG * inv + theme.selectionBackground.g * selectionOpacity));
+    bgB = clampU8(Math.round(baseB * inv + theme.selectionBackground.b * selectionOpacity));
     bgA = 255;
     if (theme.selectionForeground) {
-      fg = {
-        r: theme.selectionForeground.r,
-        g: theme.selectionForeground.g,
-        b: theme.selectionForeground.b,
-      };
+      fgR = theme.selectionForeground.r;
+      fgG = theme.selectionForeground.g;
+      fgB = theme.selectionForeground.b;
     }
   }
 
@@ -291,30 +363,30 @@ function resolveCellColors(
   if (cell.flags & CellFlags.STRIKETHROUGH) decoFlags |= DECO_STRIKETHROUGH;
   if (isHovered) decoFlags |= DECO_HYPERLINK;
 
-  let decoColor = {
-    r: fg.r,
-    g: fg.g,
-    b: fg.b,
-    a: 255,
-  };
+  let decoR = fgR;
+  let decoG = fgG;
+  let decoB = fgB;
+  let decoA = 255;
   if (decoFlags & DECO_HYPERLINK) {
-    decoColor = LINK_COLOR;
+    decoR = LINK_COLOR.r;
+    decoG = LINK_COLOR.g;
+    decoB = LINK_COLOR.b;
+    decoA = LINK_COLOR.a;
   }
 
-  return { fg, bg, fgA, bgA, decoColor, decoFlags };
-}
-
-function blendRgb(
-  base: { r: number; g: number; b: number },
-  overlay: { r: number; g: number; b: number },
-  opacity: number,
-): { r: number; g: number; b: number } {
-  const inv = 1 - opacity;
-  return {
-    r: clampU8(Math.round(base.r * inv + overlay.r * opacity)),
-    g: clampU8(Math.round(base.g * inv + overlay.g * opacity)),
-    b: clampU8(Math.round(base.b * inv + overlay.b * opacity)),
-  };
+  out.fgR = fgR;
+  out.fgG = fgG;
+  out.fgB = fgB;
+  out.fgA = fgA;
+  out.bgR = bgR;
+  out.bgG = bgG;
+  out.bgB = bgB;
+  out.bgA = bgA;
+  out.decoR = decoR;
+  out.decoG = decoG;
+  out.decoB = decoB;
+  out.decoA = decoA;
+  out.decoFlags = decoFlags;
 }
 
 function clampU8(value: number): number {
@@ -336,4 +408,26 @@ function clampAlpha(value: number): number {
   if (value < 0) return 0;
   if (value > 1) return 1;
   return value;
+}
+
+function createResolvedColors(): ResolvedCellColors {
+  return {
+    fgR: 0,
+    fgG: 0,
+    fgB: 0,
+    fgA: 0,
+    bgR: 0,
+    bgG: 0,
+    bgB: 0,
+    bgA: 0,
+    decoR: 0,
+    decoG: 0,
+    decoB: 0,
+    decoA: 0,
+    decoFlags: 0,
+  };
+}
+
+function packU8x4(a: number, b: number, c: number, d: number): number {
+  return ((a & 0xff) | ((b & 0xff) << 8) | ((c & 0xff) << 16) | ((d & 0xff) << 24)) >>> 0;
 }

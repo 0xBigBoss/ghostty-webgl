@@ -1,6 +1,16 @@
+import debug from "debug";
 import type { CellMetrics, RenderInput, Renderer, TerminalTheme } from "./types";
+
+interface WindowWithProfile extends Window {
+  __WEBGL_PROFILE__?: boolean;
+}
 import { CellBuffer } from "./CellBuffer";
 import { GlyphAtlas } from "./GlyphAtlas";
+
+// Namespaced debug loggers
+const log = debug("bootty:webgl");
+const logRender = debug("bootty:webgl:render");
+const logProfile = debug("bootty:webgl:profile");
 import { backgroundFragmentSource, backgroundVertexSource } from "./shaders/background";
 import { glyphFragmentSource, glyphVertexSource } from "./shaders/glyph";
 import { decorationFragmentSource, decorationVertexSource } from "./shaders/decoration";
@@ -48,6 +58,7 @@ export class WebGLRenderer implements Renderer {
   private forceFullUpload = true;
 
   constructor(options: WebGLRendererOptions = {}) {
+    log("WebGLRenderer constructor called");
     this.options = options;
     this.fontSize = options.fontSize ?? 15;
     this.fontFamily = options.fontFamily ?? "monospace";
@@ -67,6 +78,7 @@ export class WebGLRenderer implements Renderer {
   }
 
   attach(canvas: HTMLCanvasElement): void {
+    log("attach() called");
     this.canvas = canvas;
     const gl = canvas.getContext("webgl2", {
       antialias: this.options.antialias ?? false,
@@ -108,8 +120,21 @@ export class WebGLRenderer implements Renderer {
     this.forceFullUpload = true;
   }
 
+  private renderCallCount = 0;
+
   render(input: RenderInput): void {
     if (!this.contextValid || !this.gl || !this.canvas) return;
+
+    const PROFILE =
+      typeof window !== "undefined" && (window as WindowWithProfile).__WEBGL_PROFILE__;
+
+    // Debug: log every 50 renders to confirm render() is being called
+    this.renderCallCount++;
+    if (this.renderCallCount % 50 === 1) {
+      logRender("render() called #%d, PROFILE=%s", this.renderCallCount, PROFILE);
+    }
+
+    const t0 = PROFILE ? performance.now() : 0;
 
     const currentDpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : this.dpr;
     if (currentDpr !== this.dpr) {
@@ -123,7 +148,10 @@ export class WebGLRenderer implements Renderer {
     this.theme = input.theme;
 
     if (!this.cellBuffer || !this.glyphAtlas) return;
+
+    const t1 = PROFILE ? performance.now() : 0;
     this.cellBuffer.update(input, this.glyphAtlas, this.forceFullUpload);
+    const t2 = PROFILE ? performance.now() : 0;
     this.forceFullUpload = false;
 
     const gl = this.gl;
@@ -189,6 +217,41 @@ export class WebGLRenderer implements Renderer {
 
     if (input.scrollbarOpacity > 0 && input.scrollbackLength > 0) {
       this.drawScrollbar(input.scrollbarOpacity, input.scrollbackLength, input.viewportY);
+    }
+
+    if (PROFILE) {
+      gl.finish(); // Force GPU sync for accurate timing
+      const t3 = performance.now();
+      this.logProfile(t0, t1, t2, t3, input.cols * input.rows);
+    }
+  }
+
+  private profileSamples: { setup: number; cellBuffer: number; draw: number }[] = [];
+  private profileStartLogged = false;
+
+  private logProfile(t0: number, t1: number, t2: number, t3: number, cellCount: number): void {
+    if (!this.profileStartLogged) {
+      logProfile("Profiling active, collecting frames...");
+      this.profileStartLogged = true;
+    }
+    this.profileSamples.push({
+      setup: t1 - t0,
+      cellBuffer: t2 - t1,
+      draw: t3 - t2,
+    });
+    if (this.profileSamples.length >= 10) {
+      const avg = (arr: number[]) => arr.reduce((a, b) => a + b, 0) / arr.length;
+      const samples = this.profileSamples;
+      logProfile(
+        "%d cells, %d frames: Setup=%sms CellBuffer=%sms Draw+Sync=%sms Total=%sms",
+        cellCount,
+        samples.length,
+        avg(samples.map((s) => s.setup)).toFixed(2),
+        avg(samples.map((s) => s.cellBuffer)).toFixed(2),
+        avg(samples.map((s) => s.draw)).toFixed(2),
+        avg(samples.map((s) => s.setup + s.cellBuffer + s.draw)).toFixed(2),
+      );
+      this.profileSamples = [];
     }
   }
 
