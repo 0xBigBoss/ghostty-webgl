@@ -10,7 +10,6 @@ import { GlyphAtlas } from "./GlyphAtlas";
 // Namespaced debug loggers
 const log = debug("bootty:webgl");
 const logRender = debug("bootty:webgl:render");
-const logProfile = debug("bootty:webgl:profile");
 import { backgroundFragmentSource, backgroundVertexSource } from "./shaders/background";
 import { glyphFragmentSource, glyphVertexSource } from "./shaders/glyph";
 import { decorationFragmentSource, decorationVertexSource } from "./shaders/decoration";
@@ -126,11 +125,11 @@ export class WebGLRenderer implements Renderer {
     if (!this.contextValid || !this.gl || !this.canvas) return;
 
     const PROFILE =
-      typeof window !== "undefined" && (window as WindowWithProfile).__WEBGL_PROFILE__;
+      typeof window !== "undefined" && (window as WindowWithProfile).__WEBGL_PROFILE__ === true;
 
-    // Debug: log every 50 renders to confirm render() is being called
+    // Debug: log render count (less frequently to reduce noise)
     this.renderCallCount++;
-    if (this.renderCallCount % 50 === 1) {
+    if (this.renderCallCount === 1 || this.renderCallCount % 500 === 0) {
       logRender("render() called #%d, PROFILE=%s", this.renderCallCount, PROFILE);
     }
 
@@ -231,7 +230,7 @@ export class WebGLRenderer implements Renderer {
 
   private logProfile(t0: number, t1: number, t2: number, t3: number, cellCount: number): void {
     if (!this.profileStartLogged) {
-      logProfile("Profiling active, collecting frames...");
+      console.log("[WebGL Profile] Collecting frames...");
       this.profileStartLogged = true;
     }
     this.profileSamples.push({
@@ -242,14 +241,9 @@ export class WebGLRenderer implements Renderer {
     if (this.profileSamples.length >= 10) {
       const avg = (arr: number[]) => arr.reduce((a, b) => a + b, 0) / arr.length;
       const samples = this.profileSamples;
-      logProfile(
-        "%d cells, %d frames: Setup=%sms CellBuffer=%sms Draw+Sync=%sms Total=%sms",
-        cellCount,
-        samples.length,
-        avg(samples.map((s) => s.setup)).toFixed(2),
-        avg(samples.map((s) => s.cellBuffer)).toFixed(2),
-        avg(samples.map((s) => s.draw)).toFixed(2),
-        avg(samples.map((s) => s.setup + s.cellBuffer + s.draw)).toFixed(2),
+      const total = avg(samples.map((s) => s.setup + s.cellBuffer + s.draw));
+      console.log(
+        `[WebGL Profile] ${cellCount} cells, ${samples.length} frames: Setup=${avg(samples.map((s) => s.setup)).toFixed(2)}ms CellBuffer=${avg(samples.map((s) => s.cellBuffer)).toFixed(2)}ms Draw+Sync=${avg(samples.map((s) => s.draw)).toFixed(2)}ms Total=${total.toFixed(2)}ms`,
       );
       this.profileSamples = [];
     }
