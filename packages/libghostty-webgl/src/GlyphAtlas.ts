@@ -254,7 +254,7 @@ export class GlyphAtlas {
 
     const bearingX = -left;
     const bearingY = ascent;
-    const drawX = PADDING + bearingX;
+    const drawX = PADDING - bearingX;
     const drawY = PADDING + bearingY;
     ctx.fillText(grapheme, drawX, drawY);
 
