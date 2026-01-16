@@ -21,27 +21,30 @@ ghostty-webgl/
 
 ### Package Responsibilities
 
-| Package | Purpose |
-|---------|---------|
-| `libghostty-vt` | WASM binary + loader. VT parsing, terminal state, key encoding. Zero rendering. |
-| `libghostty-webgl` | WebGL2 renderer. Glyph atlas, instanced rendering, shaders. |
-| `ghostty-web` | High-level Terminal class. xterm.js API compatibility. Renderer abstraction. |
+| Package            | Purpose                                                                         |
+| ------------------ | ------------------------------------------------------------------------------- |
+| `libghostty-vt`    | WASM binary + loader. VT parsing, terminal state, key encoding. Zero rendering. |
+| `libghostty-webgl` | WebGL2 renderer. Glyph atlas, instanced rendering, shaders.                     |
+| `ghostty-web`      | High-level Terminal class. xterm.js API compatibility. Renderer abstraction.    |
 
 ## Implementation Phases
 
 ### Phase 1: Workspace Setup
+
 - [ ] Create monorepo with bun workspaces
 - [ ] Add ghostty submodule (Zig source for WASM reference)
 - [ ] Add ghostty-web submodule (your fork)
 - [ ] Extract libghostty-vt package from ghostty-web
 
 ### Phase 2: Glyph Atlas System
+
 - [ ] Canvas2D font rasterization → WebGL texture
 - [ ] ASCII fast path (chars 0-127 pre-rendered)
 - [ ] LRU cache for unicode/emoji glyphs
 - [ ] Sub-pixel glyph variants (3-4 offsets)
 
 ### Phase 3: WebGL2 Instanced Renderer
+
 - [ ] WebGL2 context setup with fallback detection
 - [ ] Vertex shader: instanced quad positioning
 - [ ] Fragment shader: glyph texture sampling + colors
@@ -49,6 +52,7 @@ ghostty-webgl/
 - [ ] Dirty region tracking (only update changed cells)
 
 ### Phase 4: Integration
+
 - [ ] Renderer abstraction in ghostty-web (canvas vs webgl)
 - [ ] Context loss recovery (`webglcontextlost` handling)
 - [ ] Selection rendering (background layer)
@@ -56,6 +60,7 @@ ghostty-webgl/
 - [ ] Settings: `rendererType: 'webgl' | 'canvas'`
 
 ### Phase 5: vscode-bootty Integration
+
 - [ ] Update vscode-bootty to use new packages
 - [ ] WebGL availability detection in VS Code webview
 - [ ] Performance benchmarking vs Canvas2D
@@ -76,8 +81,8 @@ ghostty-webgl/
 
 ## Related Repos
 
-| Repo | Purpose |
-|------|---------|
-| `0xBigBoss/ghostty` | Zig source fork (WASM build reference) |
-| `0xBigBoss/ghostty-web` | ghostty-web fork (Canvas2D, to add WebGL) |
-| `0xBigBoss/vscode-bootty` | VS Code extension (consumer) |
+| Repo                      | Purpose                                   |
+| ------------------------- | ----------------------------------------- |
+| `0xBigBoss/ghostty`       | Zig source fork (WASM build reference)    |
+| `0xBigBoss/ghostty-web`   | ghostty-web fork (Canvas2D, to add WebGL) |
+| `0xBigBoss/vscode-bootty` | VS Code extension (consumer)              |

@@ -12,6 +12,7 @@
 **Source**: https://github.com/coder/ghostty-web (your fork: 0xBigBoss/ghostty-web)
 
 ### Exports
+
 - `Terminal` - Main terminal class (xterm.js API compatible)
 - `Ghostty` - WASM wrapper for ghostty-vt runtime
 - `CanvasRenderer` - Canvas2D renderer
@@ -20,12 +21,14 @@
 - `SelectionManager`, `LinkDetector`, `InputHandler`
 
 ### WASM Functions (ghostty-vt.wasm)
+
 - `ghostty_terminal_new/write/resize` - Terminal lifecycle
 - `ghostty_render_state_update/get_viewport` - Render state access
 - `ghostty_key_encoder_*` - Key encoding
 - `ghostty_sgr_*` - SGR parsing
 
 ### Build Pipeline
+
 - Zig compiles ghostty source → WASM
 - `patches/ghostty-wasm-api.patch` exposes additional APIs
 - Vite bundles TypeScript wrapper
@@ -37,12 +40,14 @@
 ### xterm.js addon-webgl
 
 **Architecture**:
+
 - WebGL2-based, optional addon loaded separately
 - Glyph atlas: 32×1 grid per texture layer
 - ASCII fast path: `glyph_id = char_code | style_bits`
 - Single `drawArraysInstanced()` call per frame
 
 **Key Techniques**:
+
 - 6 buffers in VAO for state-free rendering
 - `vertexAttribDivisor()` for per-instance attributes
 - Context loss handling via `onContextLoss()` API
@@ -50,29 +55,34 @@
 ### Ghostty Native (Metal/OpenGL)
 
 **Architecture**:
+
 - Platform-native GPU APIs (Metal on macOS, OpenGL on Linux)
 - CPU: text parsing, terminal state
 - GPU: font rasterization, rendering
 - Custom GLSL shaders supported (~1-2% overhead)
 
 **Design Philosophy**:
+
 - Separates parsing (CPU) from rendering (GPU)
 - Multi-threaded with significant idle time between frames
 
 ### Common Patterns
 
 **Glyph Atlas Strategy**:
+
 1. Canvas-to-texture: Rasterize via HTML5 canvas → WebGL texture
 2. Sub-pixel variants: 4 versions at 0.0, 0.33, 0.66, 1.0 offsets
 3. LRU cache for unicode exceeding atlas capacity
 
 **Instanced Rendering Pipeline**:
+
 ```
 Per-vertex (static):  quad position (-1..+1)
 Per-instance (dynamic): cell_pos, glyph_id, fg_color, bg_color
 ```
 
 **Buffer Layout**:
+
 - Position buffer: 4 vertices × 2 floats (static)
 - Instance buffer: cell data (dynamic, ring buffer)
 - VAO encapsulates all bindings
@@ -82,10 +92,10 @@ Per-instance (dynamic): cell_pos, glyph_id, fg_color, bg_color
 ## Performance Benchmarks (VS Code PR #84440)
 
 | Platform | Terminal Size | Speedup vs Canvas2D |
-|----------|---------------|---------------------|
-| Windows | 87×26 | 901% |
-| Windows | 300×80 | 839% |
-| macOS | 300×80 | 314% |
+| -------- | ------------- | ------------------- |
+| Windows  | 87×26         | 901%                |
+| Windows  | 300×80        | 839%                |
+| macOS    | 300×80        | 314%                |
 
 ---
 
@@ -102,12 +112,14 @@ Platform: Display to user
 ```
 
 **libghostty-vt provides**:
+
 - VT100/xterm escape sequence parsing
 - Terminal state (cursor, cells, scrollback)
 - Unicode/grapheme handling
 - Key encoding (Kitty protocol, xterm modifyOtherKeys)
 
 **libghostty-vt does NOT include**:
+
 - Rendering/GPU operations
 - Font handling
 - Platform-specific UI
@@ -116,12 +128,12 @@ Platform: Display to user
 
 ## Existing Workspace Assets
 
-| Location | Description |
-|----------|-------------|
-| `/Users/allen/0xbigboss/ghostty/` | Ghostty source clone (fork remote available) |
-| `/Users/allen/0xbigboss/ghostty-vscode/` | Earlier PoC monorepo |
-| `/Users/allen/0xbigboss/ghostty-vscode/ghostty-web/` | ghostty-web fork (v0.5.0) |
-| `/Users/allen/0xbigboss/vscode-bootty/` | Production VS Code extension |
+| Location                                             | Description                                  |
+| ---------------------------------------------------- | -------------------------------------------- |
+| `/Users/allen/0xbigboss/ghostty/`                    | Ghostty source clone (fork remote available) |
+| `/Users/allen/0xbigboss/ghostty-vscode/`             | Earlier PoC monorepo                         |
+| `/Users/allen/0xbigboss/ghostty-vscode/ghostty-web/` | ghostty-web fork (v0.5.0)                    |
+| `/Users/allen/0xbigboss/vscode-bootty/`              | Production VS Code extension                 |
 
 ---
 
