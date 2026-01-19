@@ -7,6 +7,7 @@ Replace Canvas2D rendering in ghostty-web with WebGL2 for 50-100% throughput imp
 ## Progress (as of 2026-01-16)
 
 **Completed in this repo:**
+
 - Phase 1: Renderer contract + CanvasRenderer refactor + RenderInput pipeline
 - Phase 2: WebGL2 context + background-only validation pass
 - Phase 3: 32-byte instance buffer + dirty row updates
@@ -16,6 +17,7 @@ Replace Canvas2D rendering in ghostty-web with WebGL2 for 50-100% throughput imp
 - Added `vscode-bootty` as a submodule for tight integration and testing
 
 **Partial / remaining:**
+
 - Curly underline flag not wired (no flag source yet)
 - Context loss handling exists in WebGLRenderer but **fallback to Canvas** is not wired
 - Benchmarks + parity validation in downstream consumer (BooTTY) still pending
@@ -24,54 +26,57 @@ Replace Canvas2D rendering in ghostty-web with WebGL2 for 50-100% throughput imp
 ## Updated Execution Plan (includes BooTTY integration)
 
 ### A. ghostty-web / libghostty-webgl (core renderer)
-1. **Finalize Phase 7 robustness**  
-   - Wire fallback to CanvasRenderer after repeated context loss  
-   - Ensure renderer auto-detection for non-WebGL2 environments  
+
+1. **Finalize Phase 7 robustness**
+   - Wire fallback to CanvasRenderer after repeated context loss
+   - Ensure renderer auto-detection for non-WebGL2 environments
    - Add guardrails for GPU failures and recovery paths
 
-2. **Polish missing decoration edge cases**  
-   - Curly underline flag mapping (when available)  
+2. **Polish missing decoration edge cases**
+   - Curly underline flag mapping (when available)
    - Confirm selection/underline parity against CanvasRenderer
 
-3. **Package + publish**  
-   - Publish `@0xbigboss/ghostty-web` build containing the new Renderer contract  
+3. **Package + publish**
+   - Publish `@0xbigboss/ghostty-web` build containing the new Renderer contract
    - Publish `@0xbigboss/libghostty-webgl` (UMD or ESM suitable for webviews)
 
 ### B. BooTTY (VS Code extension integration)
-1. **Dependency alignment**  
-   - Update BooTTY to the new `@0xbigboss/ghostty-web` build  
-   - Add `@0xbigboss/libghostty-webgl` dependency  
+
+1. **Dependency alignment**
+   - Update BooTTY to the new `@0xbigboss/ghostty-web` build
+   - Add `@0xbigboss/libghostty-webgl` dependency
    - Prefer bundling in webview builds (no extra CSP/script tags)
 
-2. **Renderer selection plumbing**  
-   - Add `bootty.renderer` setting (`auto` | `webgl` | `canvas`)  
-   - Extend `RuntimeConfig` and `update-config` messaging to carry renderer mode  
+2. **Renderer selection plumbing**
+   - Add `bootty.renderer` setting (`auto` | `webgl` | `canvas`)
+   - Extend `RuntimeConfig` and `update-config` messaging to carry renderer mode
    - Default to `auto` and allow forced `canvas` for support/debugging
 
-3. **Webview wiring (editor + panel)**  
+3. **Webview wiring (editor + panel)**
    - In `src/webview/main.ts` and `src/webview/panel-main.ts`:
-     - Detect WebGL2 (`canvas.getContext("webgl2")`)  
-     - If allowed by setting, create `new WebGLRenderer({ onContextLoss })`  
-     - Pass renderer via `new Terminal({ renderer })`  
-     - Fall back to CanvasRenderer when unavailable or init fails  
+     - Detect WebGL2 (`canvas.getContext("webgl2")`)
+     - If allowed by setting, create `new WebGLRenderer({ onContextLoss })`
+     - Pass renderer via `new Terminal({ renderer })`
+     - Fall back to CanvasRenderer when unavailable or init fails
    - Ensure both webviews share identical renderer selection logic
 
-4. **Renderer status validation**  
-   - Webview sends `renderer-status` message on init and on fallback  
-   - Extension logs to Output Channel + optional status bar item  
+4. **Renderer status validation**
+   - Webview sends `renderer-status` message on init and on fallback
+   - Extension logs to Output Channel + optional status bar item
    - Add `BooTTY: Renderer Info` command to surface status to users
 
-5. **Context loss fallback**  
-   - In WebGLRenderer `onContextLoss`, notify extension and swap to Canvas  
-   - Recreate terminal instance (or renderer) in webview after N failures  
+5. **Context loss fallback**
+   - In WebGLRenderer `onContextLoss`, notify extension and swap to Canvas
+   - Recreate terminal instance (or renderer) in webview after N failures
    - Preserve scrollback where possible (best-effort)
 
-6. **Validation + perf**  
-   - Add a repeatable benchmark harness in BooTTY  
-   - Update QA checklist to include WebGL parity + fallback behavior  
+6. **Validation + perf**
+   - Add a repeatable benchmark harness in BooTTY
+   - Update QA checklist to include WebGL parity + fallback behavior
    - Record performance deltas vs Canvas (MiB/s, frame time)
 
 ### BooTTY Integration Checklist (concrete file targets)
+
 1. `vscode-bootty/package.json`: add dependency on `@0xbigboss/libghostty-webgl`
 2. `vscode-bootty/esbuild.config.mjs`: confirm webview bundle includes WebGL renderer
 3. `vscode-bootty/src/types/messages.ts`: add renderer config + renderer-status messages

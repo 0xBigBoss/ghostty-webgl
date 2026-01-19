@@ -2,6 +2,10 @@
 
 WebGL2 GPU-accelerated terminal rendering for ghostty-web.
 
+## Focus
+
+- Keep investigating performance issues in the BooTTY WebGL2 renderer and push toward near-native rendering performance.
+
 ## Structure
 
 - `ghostty/` - Submodule: Zig source (WASM build reference)

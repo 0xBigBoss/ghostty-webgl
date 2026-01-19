@@ -1,4 +1,3 @@
-import debug from "debug";
 import {
   CellFlags,
   DirtyState,
@@ -10,12 +9,7 @@ import {
   type TerminalTheme,
 } from "./types";
 import type { GlyphAtlas, GlyphMetrics } from "./GlyphAtlas";
-
-const logProfile = debug("bootty:webgl:cellbuffer");
-
-interface WindowWithProfile extends Window {
-  __WEBGL_PROFILE__?: boolean;
-}
+import { profileDuration, profileStart } from "./profile";
 
 const CELL_STRIDE = 32;
 const GLYPH_COLOR_ATLAS = 0x01;
@@ -82,8 +76,6 @@ export class CellBuffer {
     this.gl.bufferData(this.gl.ARRAY_BUFFER, totalBytes, this.gl.DYNAMIC_DRAW);
   }
 
-  private static profileData = { writeRows: 0, upload: 0, frames: 0, dirtyRowsTotal: 0 };
-
   update(input: RenderInput, atlas: GlyphAtlas, forceFullUpload: boolean): void {
     if (input.cols !== this.cols || input.rows !== this.rows) {
       this.resize(input.cols, input.rows);
@@ -107,51 +99,59 @@ export class CellBuffer {
 
     if (dirtyRows.length === 0) return;
 
-    const PROFILE =
-      typeof window !== "undefined" && (window as WindowWithProfile).__WEBGL_PROFILE__;
-    const t0 = PROFILE ? performance.now() : 0;
-
+    const writeStart = profileStart();
     for (const row of dirtyRows) {
       this.writeRow(row, input, atlas);
     }
 
-    const t1 = PROFILE ? performance.now() : 0;
+    profileDuration("bootty:webgl:cellbuffer-write", writeStart, {
+      cols,
+      rows,
+      dirtyRows: dirtyRows.length,
+      dirtyState: input.dirtyState,
+      forceFullUpload,
+    });
 
+    const uploadStart = profileStart();
     this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.buffer);
     const rowSize = cols * CELL_STRIDE;
+    let dirtyRanges = 0;
     if (dirtyRows.length > rows * 0.5 || forceFullUpload) {
       this.gl.bufferData(this.gl.ARRAY_BUFFER, this.u8, this.gl.DYNAMIC_DRAW);
+      dirtyRanges = 1;
     } else {
-      for (const row of dirtyRows) {
-        const offset = row * rowSize;
+      let rangeStart = dirtyRows[0];
+      let rangeEnd = dirtyRows[0];
+      const flushRange = (start: number, end: number) => {
+        const offset = start * rowSize;
+        const byteLength = (end - start + 1) * rowSize;
         this.gl.bufferSubData(
           this.gl.ARRAY_BUFFER,
           offset,
-          this.u8.subarray(offset, offset + rowSize),
+          this.u8.subarray(offset, offset + byteLength),
         );
+        dirtyRanges += 1;
+      };
+      for (let i = 1; i < dirtyRows.length; i++) {
+        const row = dirtyRows[i];
+        if (row === rangeEnd + 1) {
+          rangeEnd = row;
+          continue;
+        }
+        flushRange(rangeStart, rangeEnd);
+        rangeStart = row;
+        rangeEnd = row;
       }
+      flushRange(rangeStart, rangeEnd);
     }
-
-    if (PROFILE) {
-      const t2 = performance.now();
-      CellBuffer.profileData.writeRows += t1 - t0;
-      CellBuffer.profileData.upload += t2 - t1;
-      CellBuffer.profileData.frames++;
-      CellBuffer.profileData.dirtyRowsTotal += dirtyRows.length;
-
-      if (CellBuffer.profileData.frames >= 10) {
-        const d = CellBuffer.profileData;
-        const avgDirty = d.dirtyRowsTotal / d.frames;
-        logProfile(
-          "%d frames, avg %s dirty rows: writeRows=%sms upload=%sms",
-          d.frames,
-          avgDirty.toFixed(1),
-          (d.writeRows / d.frames).toFixed(2),
-          (d.upload / d.frames).toFixed(2),
-        );
-        CellBuffer.profileData = { writeRows: 0, upload: 0, frames: 0, dirtyRowsTotal: 0 };
-      }
-    }
+    profileDuration("bootty:webgl:cellbuffer-upload", uploadStart, {
+      cols,
+      rows,
+      dirtyRows: dirtyRows.length,
+      dirtyRanges,
+      dirtyState: input.dirtyState,
+      forceFullUpload,
+    });
   }
 
   private writeRow(row: number, input: RenderInput, atlas: GlyphAtlas): void {
