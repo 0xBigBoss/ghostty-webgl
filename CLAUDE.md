@@ -24,6 +24,11 @@ bun run knip         # Dead code detection
 bun run cpd          # Copy-paste detection
 ```
 
+## Testing
+
+- Do not ignore or skip test failures unless the user explicitly asks to ignore them.
+- Always rebuild dependent packages before running affected e2e tests (e.g., ghostty-web, libghostty-webgl, vscode-bootty).
+
 ## Tooling
 
 - **tsgo** - Native TypeScript compiler (@typescript/native-preview)

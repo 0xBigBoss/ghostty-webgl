@@ -7,7 +7,9 @@
   ],
   "scripts": {
     "build": "bun run --filter '*' build",
+    "build:deps:bootty": "cd packages/ghostty-web && bun run build && cd ../libghostty-webgl && bun run build",
     "test": "bun run --filter '*' test",
+    "test:e2e:bootty": "bun run build:deps:bootty && cd vscode-bootty && npm run test:e2e",
     "typecheck": "tsgo --build",
     "lint": "oxlint .",
     "fmt": "oxfmt .",
