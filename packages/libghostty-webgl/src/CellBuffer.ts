@@ -116,9 +116,12 @@ export class CellBuffer {
     this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.buffer);
     const rowSize = cols * CELL_STRIDE;
     let dirtyRanges = 0;
-    if (dirtyRows.length > rows * 0.5 || forceFullUpload) {
-      this.gl.bufferData(this.gl.ARRAY_BUFFER, this.u8, this.gl.DYNAMIC_DRAW);
+    let uploadedBytes = 0;
+    const fullUpload = dirtyRows.length > rows * 0.5 || forceFullUpload;
+    if (fullUpload) {
+      this.gl.bufferSubData(this.gl.ARRAY_BUFFER, 0, this.u8);
       dirtyRanges = 1;
+      uploadedBytes = this.u8.byteLength;
     } else {
       let rangeStart = dirtyRows[0];
       let rangeEnd = dirtyRows[0];
@@ -131,6 +134,7 @@ export class CellBuffer {
           this.u8.subarray(offset, offset + byteLength),
         );
         dirtyRanges += 1;
+        uploadedBytes += byteLength;
       };
       for (let i = 1; i < dirtyRows.length; i++) {
         const row = dirtyRows[i];
@@ -151,6 +155,8 @@ export class CellBuffer {
       dirtyRanges,
       dirtyState: input.dirtyState,
       forceFullUpload,
+      fullUpload,
+      uploadedBytes,
     });
   }
 
