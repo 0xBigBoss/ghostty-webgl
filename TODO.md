@@ -9,7 +9,7 @@
 - [x] Verify E2E test passes (iteration 5)
 - [x] Add test:e2e-render-compare script alias (iteration 8)
 - [x] Remove ptyFlushFastPath API additions from RuntimeConfig (iteration 9)
-- [x] Add prebuild script to fix permission denied errors (iteration 13)
+- [x] Add cross-platform out directory cleaning in esbuild config (iteration 14)
 
 ## In Progress
 - [ ] None
