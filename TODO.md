@@ -18,7 +18,21 @@
 - [ ] None
 
 ## Blocked
-- [ ] None - Issue resolved
+- [x] E2E build permission denied - multi-user environment issue (iteration 16)
+
+### Blocker Details
+The reviewer process runs as a different user than the code author (ae). Files in `vscode-bootty/out/` are owned by 'ae' and cannot be modified/removed by the reviewer user, even with:
+- `fs.promises.rm({ force: true })` - Unix doesn't allow removing files you don't own
+- Creating directories with mode 0o777 - existing files still have wrong ownership
+- Manual directory removal - recreated by my process, then owned by 'ae' again
+
+**Root cause**: User permission mismatch between Claude Code session (runs as 'ae') and Codex reviewer process (runs as different user).
+
+**Suggested fixes** (infrastructure-level):
+1. Run reviewer as same user (ae)
+2. Use shared group with write permissions on vscode-bootty/
+3. Run both processes in a container with shared user
+4. Use a build directory outside the repo that both users can access
 
 ## Notes
 
