@@ -204,27 +204,242 @@ const zshAutoPayload = [
 ```
 But the display still shows garbled text: "echo hwolo world" instead of "echo hello world".
 
-**Hypothesis**: Converting backspace (0x08) to CSI cursor left (\x1b[D) is correct, but either:
-1. The render state isn't properly marking cells as dirty when overwritten via cursor movement
-2. There's an issue with incremental rendering not updating overwritten cells
-3. Something else in the VT processing or rendering pipeline
+**Key Observation**:
+- Command OUTPUT is correct ("hello world", "test test test")
+- Only the DISPLAY of typed commands is wrong
+- Issue occurs even with `/bin/sh` (simple shell)
 
-**Changes Made for Debugging**:
-1. Added detailed byte logging to `normalizeBackspace` - shows hex input/output
-2. Added cursor position logging before/after writes that contain backspaces
-3. Force full redraw when data contains backspaces (temporary workaround to test if it's a dirty-tracking issue)
-
-**Files Modified**:
-- `packages/ghostty-web/lib/terminal.ts` - Enhanced logging and forced full redraw on backspace
-
-**Resolution**:
-E2E tests confirm the fix IS working:
+**E2E Tests All Pass**:
 - `backspace-basic`: "AB\bC" → "AC" ✓
 - `backspace-multi`: "ABC\b\bDE" → "ADE" ✓
 - `backspace-start`: "\bA" → "A" ✓
 - `backspace-sgr`: "AB\b\x1b[31mC\x1b[0m" → "AC" ✓
 - `zsh-autosuggestion-backspaces`: Complex zsh sequence → "echo hello world" ✓
+- `shell-style echo with SGR`: Characters with bold → "echo hello" ✓
+- `interleaved backspaces`: "hello\b\b\bLLO" → "heLLO" ✓
+- `rapid writes with renders`: Character-by-character writes → "hello world" ✓
 
-All tests pass with `BOOTTY_E2E_SHELL=/bin/sh BOOTTY_E2E_SUPPRESS_SHELL_RC=1 npm -C vscode-bootty run test:e2e`.
+**Unit Tests All Pass**:
+All terminal.test.ts tests pass, including new tests that simulate shell-like behavior.
 
-If manual testing still shows issues, reload VS Code to clear webview cache.
+**Current Hypothesis**:
+The issue is specific to the VS Code webview + real shell interaction. Possible causes:
+1. PTY worker batching/timing with real async I/O
+2. WebGL renderer issues specific to VS Code's webview context
+3. Race between PTY data arrival and render scheduling
+4. Something about the shell's actual escape sequences that differs from tests
+
+**Diagnostic Code Added**:
+1. `packages/ghostty-web/lib/terminal.ts`:
+   - Added `window.GHOSTTY_DEBUG_WRITES = true` flag to enable verbose write logging
+   - Logs raw input bytes, cursor positions, and viewport state after each write
+
+2. `packages/ghostty-web/lib/renderer.ts`:
+   - Logs first 3 rows of viewport cells during full renders
+
+3. `packages/libghostty-webgl/src/CellBuffer.ts`:
+   - Added `window.BOOTTY_DEBUG_CELLS = true` flag
+   - Logs cells received by WebGL renderer
+
+**To Debug in VS Code**:
+1. Open Command Palette (Cmd+Shift+P / Ctrl+Shift+P)
+2. Run "BooTTY: Toggle Render Debug Mode" to enable debug logging
+3. Open Developer Tools (Help > Toggle Developer Tools or F12)
+4. Type in the BooTTY terminal
+5. Compare logs from ghostty-web and webgl-cellbuffer to see if data differs
+6. Run "BooTTY: Toggle Render Debug Mode" again to disable
+
+**Files Modified**:
+- `packages/ghostty-web/lib/terminal.ts` - Verbose write logging
+- `packages/ghostty-web/lib/terminal.test.ts` - Added shell simulation tests
+- `packages/ghostty-web/lib/renderer.ts` - Viewport cell logging
+- `packages/libghostty-webgl/src/CellBuffer.ts` - WebGL cell logging
+
+**Next Steps**:
+1. Manually test with debug flags enabled in VS Code
+2. Compare viewport cell logs from terminal.ts vs CellBuffer.ts
+3. If cells differ, issue is in render input composition
+4. If cells are same, issue is in WebGL glyph rendering
+
+If manual testing still shows issues after these diagnostics, reload VS Code to clear webview cache.
+
+### Further Investigation: Rapid Multi-Write E2E Test
+
+**PTY Capture Analysis**:
+Analyzed existing PTY captures at `~/.config/Code/logs/*/exthost/bigboss.bootty/bootty-profiles/pty-capture-*.jsonl`. Key findings:
+- zsh sends data in rapid bursts (multiple messages within 1-5ms)
+- Each keystroke triggers multiple PTY messages with backspaces and escape sequences
+- Example flow for typing "echo":
+  1. ts=12.088: 'e' (1 byte)
+  2. ts=12.092: `\b\x1b[1m\x1b[31me\x1b[0m\x1b[39m` (20 bytes) - backspace + styled 'e'
+  3. ts=12.092: More sequences with autosuggestion (36 bytes)
+  4. ... continued rapid bursts
+
+**New E2E Test Added**:
+Created a rapid multi-write test in `runner.js` that sends the exact captured sequences as separate writes with timing delays to simulate real PTY message patterns:
+```javascript
+// Test rapid multi-write PTY pattern (from real zsh capture)
+await directWrite(directTerminalId, "\x1b[2J\x1b[H", READY_TIMEOUT_MS);
+await directWrite(directTerminalId, "e", READY_TIMEOUT_MS);
+await new Promise((r) => setTimeout(r, 5)); // Small delay
+await directWrite(directTerminalId, "\b\x1b[1m\x1b[31me\x1b[0m\x1b[39m", READY_TIMEOUT_MS);
+// ... more writes following exact capture pattern
+```
+
+**Test Results**:
+- All E2E tests PASS including the new rapid multi-write test
+- Tests pass with `/bin/sh` shell
+- Tests pass with `/bin/zsh` shell
+- Tests pass with WebGL renderer (`BOOTTY_E2E_RENDERER=webgl`)
+- Tests pass with canvas renderer (default)
+
+**Conclusion**:
+The bug cannot be reproduced in E2E tests even when:
+1. Using exact captured escape sequences from real zsh usage
+2. Simulating rapid multi-write patterns with timing delays
+3. Using WebGL renderer
+4. Using zsh as the shell
+
+The issue appears to be specific to the real VS Code runtime environment, possibly related to:
+1. User's specific zsh configuration (plugins, themes, prompt)
+2. VS Code webview state/lifecycle that differs in E2E tests
+3. GPU/WebGL context behavior in the user's environment
+4. Timing differences between automated tests and real user interaction
+
+**Next Steps**:
+1. Enable debug flags in real VS Code (`window.GHOSTTY_DEBUG_WRITES = true; window.BOOTTY_DEBUG_CELLS = true;`)
+2. Reproduce the bug while watching console logs
+3. Compare cursor positions and cell content between writes
+4. Look for any discrepancies between terminal.ts viewport and CellBuffer.ts WebGL data
+
+### Root Cause Identified: zsh-autosuggestions Silent Character Acceptance
+
+**Debug Session Analysis (2026-01-26)**:
+
+Using the new `bootty.toggleRenderDebug` command, detailed console logs revealed the exact mechanism of the bug.
+
+**Key Observation: Missing PTY Responses**
+
+When typing "echo hello world" with zsh-autosuggestions:
+1. User types 'e', 'c' → shell sends styled echo + autosuggestion "echo BOOTTY_KEY_BACKSPACE_TEST"
+2. User types 'h', 'o' → shell sends styled echo + updates autosuggestion
+3. User types 'h' (start of "hello") → shell sends 180-byte response with "hello world" suggestion
+4. User types 'e', 'l', 'l', 'o', ' ' → **NO PTY output!** (silent acceptance)
+5. User types 'w' → shell sends 17-byte response
+
+The gap between steps 3-5 is critical: zsh-autosuggestions does NOT send any PTY output for characters that match the current autosuggestion. It silently accepts them internally.
+
+**Cursor Position Mismatch**:
+
+After the 180-byte write:
+- Cursor position in ghostty-vt: column 7 (from `\x1b[10D` at end of sequence)
+- User then types 5 more chars ('e', 'l', 'l', 'o', ' ') with NO PTY output
+- zsh expects cursor to be at column 12 (after "hello ")
+- ghostty-vt still has cursor at column 7
+
+When 'w' is typed, the 17-byte response writes 'w' at column 7, overwriting 'e' → "hwllo"
+
+**Trace of Write #8 (the 'w' keystroke)**:
+```
+Input: \x1b[39mw\b\x1b[4mw\x1b[24m
+- Write 'w' at column 7 (should be column 12)
+- BS (cursor left to 6)
+- Underline 'w' at column 6
+Result: 'w' overwrites 'e' at column 7 → "hwllo" instead of "hello"
+```
+
+**Why E2E Tests Pass**:
+
+E2E tests use `directWrite` which sends the captured PTY sequences directly. The sequences include all the escape codes for cursor positioning. But the REAL zsh behavior has gaps where no PTY output is sent for matching autosuggestion characters.
+
+**Hypothesis**:
+
+zsh-autosuggestions uses a mode where matching characters are "accepted" without terminal updates. In native terminals (iTerm2, GNOME Terminal), this works because either:
+1. The terminal has local echo mode for certain operations
+2. The shell uses a terminal capability that ghostty-vt doesn't support
+3. There's some synchronization mechanism we're missing
+
+**Potential Fixes**:
+
+1. **Investigate zsh-autosuggestions settings**:
+   - `ZSH_AUTOSUGGEST_STRATEGY` - might affect how suggestions are accepted
+   - `ZSH_AUTOSUGGEST_ACCEPT_WIDGETS` - controls which widgets accept suggestions
+   - Try disabling the plugin to confirm it's the cause
+
+2. **Check terminal capabilities**:
+   - Verify `$TERM` is set correctly (should be `xterm-256color` or similar)
+   - Check if zsh queries any capabilities that ghostty-vt doesn't respond to
+
+3. **Add cursor tracking for input**:
+   - When input is sent to PTY, track where cursor SHOULD be if char is echoed
+   - Use this expected position for writes that arrive after delays
+
+4. **PTY echoing investigation**:
+   - Check if the PTY is in raw mode vs cooked mode
+   - Some modes might handle echoing differently
+
+**Files Involved**:
+- `packages/ghostty-web/lib/terminal.ts` - normalizeBackspace, cursor tracking
+- `vscode-bootty/src/terminal-manager.ts` - PTY input/output handling
+- `vscode-bootty/src/pty-service.ts` - PTY spawn configuration
+
+### Fix Applied: Stop Converting BS to CSI-D for Uint8Array (2026-01-27)
+
+**Root Cause Analysis** (from Codex agent):
+The `normalizeBackspace()` function was converting BS (0x08) to CSI-D for ALL input, including Uint8Array PTY output. This caused cursor drift because:
+1. ghostty-vt handles BS and CSI-D with subtly different semantics
+2. zsh/bash rely on precise BS behavior for cursor positioning
+3. Converting BS to CSI-D changed the cursor state in ways that caused subsequent writes to land at wrong positions
+
+**Fix Applied** in `packages/ghostty-web/lib/terminal.ts`:
+
+1. **`normalizeBackspace` simplified** (lines 740-752):
+   - For Uint8Array (PTY output): pass through unchanged
+   - For string input (user-typed data): still convert BS to CSI-D
+
+   ```typescript
+   private normalizeBackspace(data: string | Uint8Array): string | Uint8Array {
+     if (typeof data !== "string") {
+       return data;  // Pass Uint8Array unchanged - let ghostty-vt handle BS directly
+     }
+     if (!data.includes("\b")) return data;
+     return data.replace(/\x08/g, Terminal.CSI_LEFT);
+   }
+   ```
+
+2. **`needsFullRender` uses original hasBS** (line 641):
+   - Check for BS in original data BEFORE normalization
+   - Force full render when BS present (cursor movement may overwrite cells)
+
+   ```typescript
+   const hasBS = typeof data === "string" ? data.includes("\b") : data.includes(0x08);
+   const normalized = this.normalizeBackspace(data);
+   const analysis = this.analyzeWriteControls(normalized);
+   const needsFullRender = analysis.forceFullReason !== null || hasBS || analysis.hasCarriageReturn;
+   ```
+
+**E2E Tests Added** in `packages/ghostty-web/playwright/tests/functional/backspace-cursor.spec.ts`:
+- "CSI D with count should move cursor correctly" - verifies ESC[nD moves cursor correctly
+- "zsh autosuggest sequence cursor position tracking" - documents mathematically correct cursor behavior
+- "plain text echo renders without BS or CR" - verifies character-by-character echo works
+- "plain text echo via Uint8Array renders correctly" - verifies Uint8Array path works
+
+**Test Results**:
+- All 7 E2E tests pass (backspace-cursor.spec.ts)
+- 334/336 unit tests pass (2 pre-existing failures unrelated to this fix)
+
+**Bash Echo Issue Report**:
+User reported that with plain bash (`/usr/bin/sh`), typed characters don't appear on screen until command output. Analysis:
+1. E2E tests for plain text echo pass (both string and Uint8Array)
+2. Core rendering works correctly (confirmed by tests)
+3. Issue may be specific to VS Code integration (PTY→extension→webview pipeline)
+4. Could also be transient state issue resolved by rebuild
+
+**To Verify Fix Works**:
+1. Rebuild all packages: `npm -C packages/ghostty-web run build && npm -C packages/libghostty-webgl run build && npm -C vscode-bootty run build`
+2. Reload VS Code window
+3. Open BooTTY terminal with zsh
+4. Type "echo hello world" - should display correctly without garbling
+
+**Shell Config Added** (by Codex agent):
+`vscode-bootty/src/terminal-manager.ts` - Added `resolveShellConfig()` for `bootty.shell` and `bootty.shellArgs` settings
