@@ -116,98 +116,15 @@ export class WebGLRenderer implements Renderer {
   }
 
   render(input: RenderInput): void {
-    if (!this.contextValid || !this.gl || !this.canvas) return;
-
+    if (!this.prepareFrame(input)) return;
     const renderStart = profileStart();
 
-    const currentDpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : this.dpr;
-    if (currentDpr !== this.dpr) {
-      this.setDevicePixelRatio(currentDpr);
-    }
-
-    if (input.cols !== this.gridCols || input.rows !== this.gridRows) {
-      this.resize(input.cols, input.rows);
-    }
-
-    this.theme = input.theme;
-
-    if (!this.cellBuffer || !this.glyphAtlas) return;
-
-    const cellBufferStart = profileStart();
-    this.cellBuffer.update(input, this.glyphAtlas, this.forceFullUpload);
-    profileDuration("bootty:webgl:cellbuffer-update", cellBufferStart, {
-      cols: input.cols,
-      rows: input.rows,
-      dirtyState: input.dirtyState,
-      forceFullUpload: this.forceFullUpload,
-    });
-    this.forceFullUpload = false;
-
-    const gl = this.gl;
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    gl.disable(gl.DEPTH_TEST);
-    gl.disable(gl.SCISSOR_TEST);
-
-    const bg = input.theme.background;
-    gl.clearColor((bg.r / 255) * bg.a, (bg.g / 255) * bg.a, (bg.b / 255) * bg.a, bg.a);
-    gl.clear(gl.COLOR_BUFFER_BIT);
+    this.updateInstanceData(input);
 
     const instanceCount = input.cols * input.rows;
-    const cellSize = this.cellSizePx;
-    const gridSize = { x: input.cols, y: input.rows };
-
     const drawStart = profileStart();
-    if (this.background) {
-      gl.useProgram(this.background.program);
-      gl.bindVertexArray(this.background.vao);
-      gl.uniform2f(this.background.uniforms["u_cellSize"], cellSize.width, cellSize.height);
-      gl.uniform2f(this.background.uniforms["u_gridSize"], gridSize.x, gridSize.y);
-      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
-    }
-
-    if (this.glyph) {
-      gl.useProgram(this.glyph.program);
-      gl.bindVertexArray(this.glyph.vao);
-      gl.uniform2f(this.glyph.uniforms["u_cellSize"], cellSize.width, cellSize.height);
-      gl.uniform2f(this.glyph.uniforms["u_gridSize"], gridSize.x, gridSize.y);
-      gl.uniform2f(this.glyph.uniforms["u_atlasSize"], this.glyphAtlas.size, this.glyphAtlas.size);
-      gl.uniform1f(this.glyph.uniforms["u_baseline"], cellSize.baseline);
-
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, this.glyphAtlas.texture);
-      gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, this.glyphAtlas.colorAtlas);
-
-      gl.uniform1i(this.glyph.uniforms["u_atlas"], 0);
-      gl.uniform1i(this.glyph.uniforms["u_colorAtlas"], 1);
-
-      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
-    }
-
-    if (this.decoration) {
-      gl.useProgram(this.decoration.program);
-      gl.bindVertexArray(this.decoration.vao);
-      gl.uniform2f(this.decoration.uniforms["u_cellSize"], cellSize.width, cellSize.height);
-      gl.uniform2f(this.decoration.uniforms["u_gridSize"], gridSize.x, gridSize.y);
-      gl.uniform1f(this.decoration.uniforms["u_baseline"], cellSize.baseline);
-      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
-    }
-
-    if (input.cursorVisible) {
-      const cursorSize = computeCursorSizePx(input.cursorStyle, this.metrics, this.dpr);
-      const originX = input.cursorX * cellSize.width;
-      const originY = input.cursorY * cellSize.height;
-      this.drawSolidRect(
-        { x: originX + cursorSize.offsetX, y: originY + cursorSize.offsetY },
-        { width: cursorSize.width, height: cursorSize.height },
-        this.theme.cursor,
-      );
-    }
-
-    if (input.scrollbarOpacity > 0 && input.scrollbackLength > 0) {
-      this.drawScrollbar(input.scrollbarOpacity, input.scrollbackLength, input.viewportY);
-    }
+    this.drawFramePasses(input, instanceCount);
+    this.drawOverlays(input);
     profileDuration("bootty:webgl:draw", drawStart, {
       cols: input.cols,
       rows: input.rows,
@@ -322,6 +239,106 @@ export class WebGLRenderer implements Renderer {
     );
 
     this.forceFullUpload = true;
+  }
+
+  private prepareFrame(input: RenderInput): boolean {
+    if (!this.contextValid || !this.gl || !this.canvas) return false;
+
+    const currentDpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : this.dpr;
+    if (currentDpr !== this.dpr) {
+      this.setDevicePixelRatio(currentDpr);
+    }
+
+    if (input.cols !== this.gridCols || input.rows !== this.gridRows) {
+      this.resize(input.cols, input.rows);
+    }
+
+    this.theme = input.theme;
+
+    return !!this.cellBuffer && !!this.glyphAtlas;
+  }
+
+  private updateInstanceData(input: RenderInput): void {
+    if (!this.cellBuffer || !this.glyphAtlas) return;
+
+    const cellBufferStart = profileStart();
+    this.cellBuffer.update(input, this.glyphAtlas, this.forceFullUpload);
+    profileDuration("bootty:webgl:cellbuffer-update", cellBufferStart, {
+      cols: input.cols,
+      rows: input.rows,
+      dirtyState: input.dirtyState,
+      forceFullUpload: this.forceFullUpload,
+    });
+    this.forceFullUpload = false;
+  }
+
+  private drawFramePasses(input: RenderInput, instanceCount: number): void {
+    if (!this.gl || !this.glyphAtlas) return;
+    const gl = this.gl;
+    const cellSize = this.cellSizePx;
+
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.SCISSOR_TEST);
+
+    const bg = input.theme.background;
+    gl.clearColor((bg.r / 255) * bg.a, (bg.g / 255) * bg.a, (bg.b / 255) * bg.a, bg.a);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    if (this.background) {
+      gl.useProgram(this.background.program);
+      gl.bindVertexArray(this.background.vao);
+      gl.uniform2f(this.background.uniforms["u_cellSize"], cellSize.width, cellSize.height);
+      gl.uniform2f(this.background.uniforms["u_gridSize"], input.cols, input.rows);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
+    }
+
+    if (this.glyph) {
+      gl.useProgram(this.glyph.program);
+      gl.bindVertexArray(this.glyph.vao);
+      gl.uniform2f(this.glyph.uniforms["u_cellSize"], cellSize.width, cellSize.height);
+      gl.uniform2f(this.glyph.uniforms["u_gridSize"], input.cols, input.rows);
+      gl.uniform2f(this.glyph.uniforms["u_atlasSize"], this.glyphAtlas.size, this.glyphAtlas.size);
+      gl.uniform1f(this.glyph.uniforms["u_baseline"], cellSize.baseline);
+
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.glyphAtlas.texture);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, this.glyphAtlas.colorAtlas);
+
+      gl.uniform1i(this.glyph.uniforms["u_atlas"], 0);
+      gl.uniform1i(this.glyph.uniforms["u_colorAtlas"], 1);
+
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
+    }
+
+    if (this.decoration) {
+      gl.useProgram(this.decoration.program);
+      gl.bindVertexArray(this.decoration.vao);
+      gl.uniform2f(this.decoration.uniforms["u_cellSize"], cellSize.width, cellSize.height);
+      gl.uniform2f(this.decoration.uniforms["u_gridSize"], input.cols, input.rows);
+      gl.uniform1f(this.decoration.uniforms["u_baseline"], cellSize.baseline);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount);
+    }
+  }
+
+  private drawOverlays(input: RenderInput): void {
+    const cellSize = this.cellSizePx;
+    if (input.cursorVisible) {
+      const cursorSize = computeCursorSizePx(input.cursorStyle, this.metrics, this.dpr);
+      const originX = input.cursorX * cellSize.width;
+      const originY = input.cursorY * cellSize.height;
+      this.drawSolidRect(
+        { x: originX + cursorSize.offsetX, y: originY + cursorSize.offsetY },
+        { width: cursorSize.width, height: cursorSize.height },
+        this.theme.cursor,
+      );
+    }
+
+    if (input.scrollbarOpacity > 0 && input.scrollbackLength > 0) {
+      this.drawScrollbar(input.scrollbarOpacity, input.scrollbackLength, input.viewportY);
+    }
   }
 
   private createProgramInfo(

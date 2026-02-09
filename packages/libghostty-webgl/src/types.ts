@@ -1,3 +1,6 @@
+// Keep renderer contract local to avoid runtime coupling to ghostty-web entrypoint
+// exports that may not exist in older compatible peer versions.
+
 export interface CellMetrics {
   width: number;
   height: number;
@@ -46,22 +49,24 @@ export const ROW_DIRTY = 0x01;
 export const ROW_HAS_SELECTION = 0x02;
 export const ROW_HAS_HYPERLINK = 0x04;
 
-export enum DirtyState {
-  NONE = 0,
-  PARTIAL = 1,
-  FULL = 2,
-}
+export const DirtyState = {
+  NONE: 0,
+  PARTIAL: 1,
+  FULL: 2,
+} as const;
 
-export enum CellFlags {
-  BOLD = 1 << 0,
-  ITALIC = 1 << 1,
-  UNDERLINE = 1 << 2,
-  STRIKETHROUGH = 1 << 3,
-  INVERSE = 1 << 4,
-  INVISIBLE = 1 << 5,
-  BLINK = 1 << 6,
-  FAINT = 1 << 7,
-}
+export type DirtyState = (typeof DirtyState)[keyof typeof DirtyState];
+
+export const CellFlags = {
+  BOLD: 1 << 0,
+  ITALIC: 1 << 1,
+  UNDERLINE: 1 << 2,
+  STRIKETHROUGH: 1 << 3,
+  INVERSE: 1 << 4,
+  INVISIBLE: 1 << 5,
+  BLINK: 1 << 6,
+  FAINT: 1 << 7,
+} as const;
 
 export interface GhosttyCell {
   codepoint: number;
@@ -77,10 +82,14 @@ export interface GhosttyCell {
   grapheme_len: number;
 }
 
+export type GraphemeRow = ReadonlyArray<string | undefined>;
+export type GraphemeRows = ReadonlyArray<GraphemeRow | undefined>;
+
 export interface RenderInput {
   cols: number;
   rows: number;
   viewportCells: GhosttyCell[];
+  graphemeRows: GraphemeRows;
   rowFlags: Uint8Array;
   dirtyState: DirtyState;
   selectionRange: SelectionRange | null;
@@ -89,7 +98,7 @@ export interface RenderInput {
   cursorY: number;
   cursorVisible: boolean;
   cursorStyle: CursorStyle;
-  getGraphemeString(viewportRow: number, col: number): string;
+  getGraphemeString?: (viewportRow: number, col: number) => string;
   theme: TerminalTheme;
   viewportY: number;
   scrollbackLength: number;

@@ -11,6 +11,7 @@ export interface GlyphMetrics {
 }
 
 interface Shelf {
+  id: number;
   y: number;
   height: number;
   nextX: number;
@@ -21,6 +22,7 @@ interface AtlasPage {
   height: number;
   shelves: Shelf[];
   nextShelfY: number;
+  nextShelfId: number;
 }
 
 interface GlyphEntry extends GlyphMetrics {
@@ -31,6 +33,7 @@ interface GlyphEntry extends GlyphMetrics {
   isColor: boolean;
   pinned: boolean;
   lastUsed: number;
+  shelfId: number;
 }
 
 interface GlyphRequest {
@@ -82,12 +85,19 @@ export class GlyphAtlas {
     this.atlasTexture = atlasTexture;
     this.colorTexture = colorTexture;
 
-    this.page = { width: this.atlasSize, height: this.atlasSize, shelves: [], nextShelfY: 0 };
+    this.page = {
+      width: this.atlasSize,
+      height: this.atlasSize,
+      shelves: [],
+      nextShelfY: 0,
+      nextShelfId: 1,
+    };
     this.colorPage = {
       width: this.colorAtlasSize,
       height: this.colorAtlasSize,
       shelves: [],
       nextShelfY: 0,
+      nextShelfId: 1,
     };
 
     this.canvas = createCanvas(1, 1);
@@ -148,9 +158,13 @@ export class GlyphAtlas {
     const created = this.addGlyph(request);
     if (created) return created;
 
-    this.rebuildAtlas(request);
-    const retry = this.addGlyph(request);
-    if (retry) return retry;
+    while (this.evictLeastRecentlyUsedShelf(request.isColor)) {
+      const retry = this.addGlyph(request);
+      if (retry) return retry;
+    }
+
+    const repacked = this.repackAndAddGlyph(request);
+    if (repacked) return repacked;
 
     const fallback = this.createPlaceholder(request);
     this.glyphs.set(key, fallback);
@@ -202,6 +216,7 @@ export class GlyphAtlas {
       isColor: request.isColor,
       pinned: request.pinned,
       lastUsed: lastUsed ?? ++this.useCounter,
+      shelfId: metrics.shelfId,
     };
     if (lastUsed !== undefined && lastUsed > this.useCounter) {
       this.useCounter = lastUsed;
@@ -210,7 +225,7 @@ export class GlyphAtlas {
     return entry;
   }
 
-  private tryRasterizeGlyph(request: GlyphRequest): GlyphMetrics | null {
+  private tryRasterizeGlyph(request: GlyphRequest): (GlyphMetrics & { shelfId: number }) | null {
     const { grapheme, bold, italic, isColor } = request;
     const ctx = isColor ? this.colorCtx : this.ctx;
     const canvas = isColor ? this.colorCanvas : this.canvas;
@@ -232,7 +247,10 @@ export class GlyphAtlas {
     const height = Math.ceil(ascent + descent);
 
     if (width === 0 || height === 0) {
-      return emptyMetrics(isColor);
+      return {
+        ...emptyMetrics(isColor),
+        shelfId: -1,
+      };
     }
 
     const paddedW = width + PADDING * 2;
@@ -313,38 +331,172 @@ export class GlyphAtlas {
       width,
       height,
       isColor,
+      shelfId: alloc.shelfId,
     };
   }
 
-  private rebuildAtlas(priority?: GlyphRequest): void {
-    const previousEntries = Array.from(this.glyphs.values());
-    const nonPinned = previousEntries
-      .filter((entry) => !entry.pinned)
+  private evictLeastRecentlyUsedShelf(isColor: boolean): boolean {
+    const page = isColor ? this.colorPage : this.page;
+    const candidate = this.findEvictionShelf(page, isColor);
+    if (!candidate) {
+      return false;
+    }
+
+    let removed = 0;
+    for (const [key, entry] of this.glyphs.entries()) {
+      if (entry.isColor !== isColor || entry.shelfId !== candidate.id) continue;
+      if (entry.pinned) {
+        return false;
+      }
+      this.glyphs.delete(key);
+      removed++;
+    }
+    if (removed === 0) {
+      return false;
+    }
+
+    this.clearShelfTexture(candidate, isColor, page.width);
+    candidate.nextX = 0;
+    return true;
+  }
+
+  private findEvictionShelf(page: AtlasPage, isColor: boolean): Shelf | null {
+    let bestShelf: Shelf | null = null;
+    let bestNewestUsed = Number.POSITIVE_INFINITY;
+    for (const shelf of page.shelves) {
+      let hasEntries = false;
+      let hasPinned = false;
+      let shelfNewestUsed = Number.NEGATIVE_INFINITY;
+      for (const entry of this.glyphs.values()) {
+        if (entry.isColor !== isColor || entry.shelfId !== shelf.id) continue;
+        hasEntries = true;
+        if (entry.pinned) {
+          hasPinned = true;
+          break;
+        }
+        shelfNewestUsed = Math.max(shelfNewestUsed, entry.lastUsed);
+      }
+      if (!hasEntries || hasPinned) continue;
+      if (shelfNewestUsed < bestNewestUsed) {
+        bestNewestUsed = shelfNewestUsed;
+        bestShelf = shelf;
+      }
+    }
+    return bestShelf;
+  }
+
+  private clearShelfTexture(shelf: Shelf, isColor: boolean, width: number): void {
+    const gl = this.gl;
+    if (isColor) {
+      const byteLength = width * shelf.height * 4;
+      const zero = new Uint8Array(byteLength);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, this.colorTexture);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texSubImage2D(
+        gl.TEXTURE_2D,
+        0,
+        0,
+        shelf.y,
+        width,
+        shelf.height,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        zero,
+      );
+      return;
+    }
+
+    const byteLength = width * shelf.height;
+    const zero = new Uint8Array(byteLength);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.atlasTexture);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texSubImage2D(
+      gl.TEXTURE_2D,
+      0,
+      0,
+      shelf.y,
+      width,
+      shelf.height,
+      gl.RED,
+      gl.UNSIGNED_BYTE,
+      zero,
+    );
+  }
+
+  private repackAndAddGlyph(request: GlyphRequest): GlyphEntry | null {
+    const isColor = request.isColor;
+    const currentEntries = Array.from(this.glyphs.values())
+      .filter((entry) => entry.isColor === isColor && entry.shelfId >= 0)
       .sort((a, b) => b.lastUsed - a.lastUsed);
-    const priorityKey = priority ? this.makeKey(priority) : null;
 
-    this.resetPages();
-    this.recreateTextures();
-    this.glyphs.clear();
-    this.prewarmAscii();
+    const requestKey = this.makeKey(request);
+    const pinnedEntries = currentEntries.filter(
+      (entry) => entry.pinned && entry.key !== requestKey,
+    );
+    const nonPinnedEntries = currentEntries.filter(
+      (entry) => !entry.pinned && entry.key !== requestKey,
+    );
 
-    if (priority && !priority.pinned) {
-      this.addGlyph(priority);
+    for (const [key, entry] of this.glyphs.entries()) {
+      if (entry.isColor === isColor) {
+        this.glyphs.delete(key);
+      }
     }
 
-    for (const entry of nonPinned) {
-      if (priorityKey && entry.key === priorityKey) continue;
+    this.resetPage(isColor);
+    this.clearFullPageTexture(isColor);
+
+    for (const entry of pinnedEntries) {
+      this.addGlyph(
+        {
+          grapheme: entry.grapheme,
+          bold: entry.bold,
+          italic: entry.italic,
+          isColor: entry.isColor,
+          pinned: entry.pinned,
+        },
+        entry.lastUsed,
+      );
+    }
+
+    const addedRequest = this.addGlyph(request);
+
+    for (const entry of nonPinnedEntries) {
       if (this.glyphs.has(entry.key)) continue;
-      const request: GlyphRequest = {
-        grapheme: entry.grapheme,
-        bold: entry.bold,
-        italic: entry.italic,
-        isColor: entry.isColor,
-        pinned: entry.pinned,
-      };
-      const added = this.addGlyph(request, entry.lastUsed);
-      if (!added) break;
+      this.addGlyph(
+        {
+          grapheme: entry.grapheme,
+          bold: entry.bold,
+          italic: entry.italic,
+          isColor: entry.isColor,
+          pinned: entry.pinned,
+        },
+        entry.lastUsed,
+      );
     }
+
+    return addedRequest;
+  }
+
+  private resetPage(isColor: boolean): void {
+    if (isColor) {
+      this.colorPage = createEmptyPage(this.colorAtlasSize);
+      return;
+    }
+    this.page = createEmptyPage(this.atlasSize);
+  }
+
+  private clearFullPageTexture(isColor: boolean): void {
+    const page = isColor ? this.colorPage : this.page;
+    const fullPageShelf: Shelf = {
+      id: -1,
+      y: 0,
+      height: page.height,
+      nextX: 0,
+    };
+    this.clearShelfTexture(fullPageShelf, isColor, page.width);
   }
 
   private createPlaceholder(request: GlyphRequest): GlyphEntry {
@@ -357,17 +509,13 @@ export class GlyphAtlas {
       isColor: request.isColor,
       pinned: request.pinned,
       lastUsed: ++this.useCounter,
+      shelfId: -1,
     };
   }
 
   private resetPages(): void {
-    this.page = { width: this.atlasSize, height: this.atlasSize, shelves: [], nextShelfY: 0 };
-    this.colorPage = {
-      width: this.colorAtlasSize,
-      height: this.colorAtlasSize,
-      shelves: [],
-      nextShelfY: 0,
-    };
+    this.page = createEmptyPage(this.atlasSize);
+    this.colorPage = createEmptyPage(this.colorAtlasSize);
   }
 
   private recreateTextures(): void {
@@ -394,21 +542,31 @@ function allocateRect(
   page: AtlasPage,
   width: number,
   height: number,
-): { x: number; y: number } | null {
+): { x: number; y: number; shelfId: number } | null {
   for (const shelf of page.shelves) {
     if (shelf.height >= height && page.width - shelf.nextX >= width) {
       const x = shelf.nextX;
       shelf.nextX += width;
-      return { x, y: shelf.y };
+      return { x, y: shelf.y, shelfId: shelf.id };
     }
   }
   if (page.nextShelfY + height <= page.height) {
-    const shelf = { y: page.nextShelfY, height, nextX: width };
+    const shelf = { id: page.nextShelfId++, y: page.nextShelfY, height, nextX: width };
     page.shelves.push(shelf);
     page.nextShelfY += height;
-    return { x: 0, y: shelf.y };
+    return { x: 0, y: shelf.y, shelfId: shelf.id };
   }
   return null;
+}
+
+function createEmptyPage(size: number): AtlasPage {
+  return {
+    width: size,
+    height: size,
+    shelves: [],
+    nextShelfY: 0,
+    nextShelfId: 1,
+  };
 }
 
 function extractAlpha(data: Uint8ClampedArray, width: number, height: number): Uint8Array {

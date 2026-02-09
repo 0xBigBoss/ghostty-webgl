@@ -1,6 +1,7 @@
 import {
   CellFlags,
   DirtyState,
+  type GraphemeRows,
   ROW_DIRTY,
   ROW_HAS_HYPERLINK,
   ROW_HAS_SELECTION,
@@ -22,6 +23,7 @@ const _DECO_CURLY = 0x08;
 const LINK_COLOR = { r: 74, g: 144, b: 226, a: 255 };
 const ASCII_CACHE: string[] = Array.from({ length: 128 }, (_, i) => String.fromCharCode(i));
 const SPACE_CODEPOINT = 32;
+const EMPTY_GRAPHEME_ROWS: GraphemeRows = [];
 
 interface ResolvedCellColors {
   fgR: number;
@@ -76,6 +78,11 @@ export class CellBuffer {
     this.gl.bufferData(this.gl.ARRAY_BUFFER, totalBytes, this.gl.DYNAMIC_DRAW);
   }
 
+  // Debug: enable verbose cell logging via window flag
+  private static shouldDebugCells(): boolean {
+    return typeof window !== "undefined" && (window as any).BOOTTY_DEBUG_CELLS === true;
+  }
+
   update(input: RenderInput, atlas: GlyphAtlas, forceFullUpload: boolean): void {
     if (input.cols !== this.cols || input.rows !== this.rows) {
       this.resize(input.cols, input.rows);
@@ -99,9 +106,31 @@ export class CellBuffer {
 
     if (dirtyRows.length === 0) return;
 
+    // Diagnostic: dump first 3 rows of cells received by WebGL renderer
+    if (CellBuffer.shouldDebugCells() && input.dirtyState === DirtyState.FULL) {
+      for (let row = 0; row < Math.min(3, rows); row++) {
+        const rowBase = row * cols;
+        let text = "";
+        for (let col = 0; col < cols; col++) {
+          const cell = input.viewportCells[rowBase + col];
+          if (cell && cell.codepoint > SPACE_CODEPOINT) {
+            text += String.fromCodePoint(cell.codepoint);
+          } else {
+            text += " ";
+          }
+        }
+        console.log(`[webgl-cellbuffer] row ${row}: "${text.trimEnd()}"`);
+      }
+    }
+
     const writeStart = profileStart();
+    const hasPreResolvedRows = input.graphemeRows && input.graphemeRows.length > 0;
+    const graphemeRows = hasPreResolvedRows
+      ? input.graphemeRows
+      : this.resolveLegacyGraphemeRows(input, dirtyRows);
+    const sparseLegacyFallback = hasPreResolvedRows ? input.getGraphemeString : undefined;
     for (const row of dirtyRows) {
-      this.writeRow(row, input, atlas);
+      this.writeRow(row, input, atlas, graphemeRows[row], sparseLegacyFallback);
     }
 
     profileDuration("bootty:webgl:cellbuffer-write", writeStart, {
@@ -160,7 +189,13 @@ export class CellBuffer {
     });
   }
 
-  private writeRow(row: number, input: RenderInput, atlas: GlyphAtlas): void {
+  private writeRow(
+    row: number,
+    input: RenderInput,
+    atlas: GlyphAtlas,
+    graphemeRow: ReadonlyArray<string | undefined> | undefined,
+    sparseLegacyFallback: ((viewportRow: number, col: number) => string) | undefined,
+  ): void {
     const cols = input.cols;
     const rowOffset = row * cols * CELL_STRIDE;
     const rowBase = row * cols;
@@ -234,7 +269,13 @@ export class CellBuffer {
         let grapheme = "";
         let hasGlyph = false;
         if (cell.grapheme_len > 0) {
-          grapheme = input.getGraphemeString(row, col);
+          const preResolved = graphemeRow?.[col];
+          grapheme =
+            preResolved !== undefined
+              ? preResolved
+              : sparseLegacyFallback
+                ? sparseLegacyFallback(row, col)
+                : "";
           if (grapheme.length === 1) {
             hasGlyph = grapheme.charCodeAt(0) > SPACE_CODEPOINT;
           } else {
@@ -294,6 +335,43 @@ export class CellBuffer {
 
       this.view.setUint32(offset + 28, 0, true);
     }
+  }
+
+  private resolveLegacyGraphemeRows(input: RenderInput, dirtyRows: number[]): GraphemeRows {
+    if (!input.getGraphemeString) {
+      return EMPTY_GRAPHEME_ROWS;
+    }
+    const rows = input.rows;
+    const legacyRows: Array<Array<string | undefined> | undefined> = Array.from(
+      { length: rows },
+      () => undefined,
+    );
+    for (const row of dirtyRows) {
+      const rowData = this.resolveLegacyGraphemeRow(input, row);
+      if (rowData) {
+        legacyRows[row] = rowData;
+      }
+    }
+    return legacyRows;
+  }
+
+  private resolveLegacyGraphemeRow(
+    input: RenderInput,
+    row: number,
+  ): Array<string | undefined> | undefined {
+    if (!input.getGraphemeString) {
+      return undefined;
+    }
+    const cols = input.cols;
+    const rowOffset = row * cols;
+    let rowData: Array<string | undefined> | undefined;
+    for (let col = 0; col < cols; col++) {
+      const cell = input.viewportCells[rowOffset + col];
+      if (!cell || cell.width === 0 || cell.grapheme_len <= 0) continue;
+      rowData ??= Array.from({ length: cols }, () => undefined);
+      rowData[col] = input.getGraphemeString(row, col);
+    }
+    return rowData;
   }
 
   private writeEmptyCell(offset: number): void {
